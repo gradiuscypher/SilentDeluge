@@ -6,6 +6,7 @@ SilentDeluge is a proposed open-source monitoring system for homelabs, personal 
 
 - [Milestone plan](PLAN.md): first deliverable, local verification, and the public/private boundary.
 - [Domain glossary](CONTEXT.md): agreed meanings and constraints for inventory, permissions, monitoring, and evidence.
+- [Incus provider setup handoff](INCUS-SETUP.md): private identity provisioning, verification, and one-scan acceptance.
 - [MIT license](LICENSE): license for original project material.
 
 ## Try the inventory locally
