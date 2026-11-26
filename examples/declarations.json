@@ -1,0 +1,12 @@
+{
+  "source": "synthetic-definitions",
+  "scope": "toy-theatre",
+  "timestamp": "2025-01-01T09:00:00Z",
+  "containers": [
+    {"name": "velvet-curtain", "cpu": "2", "memory": "1GiB"},
+    {"name": "paper-moon"}
+  ],
+  "vms": [
+    {"name": "tin-piano", "cpu": "2"}
+  ]
+}
