@@ -1,0 +1,13 @@
+{
+  "target": {
+    "repo": "example-owner/example-repo",
+    "project_owner": "example-organization",
+    "project_number": 1,
+    "project_title": "Inventory Foundations",
+    "base_ref": "main"
+  },
+  "ready_status": "Todo",
+  "repo_identity": {"anonymous": true},
+  "project_identity": {"token_env": "FACTORY_PROJECT_TOKEN"},
+  "state_dir": "/var/lib/silentdeluge-factory"
+}

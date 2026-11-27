@@ -1,0 +1,1 @@
+"""SilentDeluge factory controller."""
