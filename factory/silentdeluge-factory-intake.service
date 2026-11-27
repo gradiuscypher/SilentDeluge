@@ -1,0 +1,25 @@
+[Unit]
+Description=SilentDeluge GitHub factory read-only intake
+Wants=network-online.target
+Requires=silentdeluge-factory-project-refresh.service
+After=network-online.target silentdeluge-factory-project-refresh.service
+
+[Service]
+Type=oneshot
+User=silentdeluge-factory
+Group=silentdeluge-factory
+WorkingDirectory=/opt/silentdeluge-factory
+EnvironmentFile=/run/silentdeluge-factory-credentials/project.env
+ExecStart=/usr/bin/python3 -B -m factory --config /etc/silentdeluge-factory/intake.json intake
+StateDirectory=silentdeluge-factory
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+TimeoutStartSec=5min
+StandardOutput=null

@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll GitHub for SilentDeluge factory intake
+
+[Timer]
+OnCalendar=*:0/5
+RandomizedDelaySec=30s
+Persistent=true
+Unit=silentdeluge-factory-intake.service
+
+[Install]
+WantedBy=timers.target
