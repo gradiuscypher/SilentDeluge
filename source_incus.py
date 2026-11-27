@@ -1,6 +1,7 @@
 """Read operator-pushed Incus files; run directly to make an operator export."""
 
 from datetime import datetime, timezone
+from ipaddress import ip_address
 import json
 from math import isfinite
 from pathlib import Path
@@ -13,6 +14,7 @@ from metrics_inventory import LABEL
 _LIMITS = ('limits.cpu', 'limits.memory')
 _KINDS = ('container', 'virtual-machine')
 _INSTANCE_DETAILS = ('architecture', 'location', 'profiles', 'ephemeral', 'created_at', 'last_used_at')
+_ADDRESS_SOURCE = 'incus-instance-state'
 _CPU = 'incus_cpu_seconds_total'
 _BOOT = 'incus_boot_time_seconds'
 _TIME = 'incus_time_seconds'
@@ -111,6 +113,38 @@ def _instance_records(instances, project):
     return records
 
 
+def _guest_ip(value):
+    if isinstance(value, str) and '%' not in value:
+        try:
+            return ip_address(value)
+        except ValueError:
+            pass
+    raise ValueError('invalid Incus guest IP address')
+
+
+def _address_projection(scope, timestamp, pairs):
+    return dict(source=_ADDRESS_SOURCE, scope=scope, timestamp=timestamp,
+                records=[dict(name=name, ip_address=address) for name, address in sorted(pairs)])
+
+
+def _guest_address_capture(capture, scope, inventory):
+    if (not isinstance(capture, dict) or capture.keys() != {'source', 'scope', 'timestamp', 'records'}
+            or capture['source'] != _ADDRESS_SOURCE or capture['scope'] != scope or '/' not in scope
+            or not isinstance(capture['records'], list)):
+        raise ValueError('invalid scoped Incus guest address capture')
+    timestamp = _timestamp(capture['timestamp'], 'Incus guest address capture')
+    running = {row['name'] for row in inventory if row['state'].casefold() == 'running'}
+    pairs = set()
+    for row in capture['records']:
+        if not isinstance(row, dict) or row.keys() != {'name', 'ip_address'}:
+            raise ValueError('invalid Incus guest address record')
+        name, address = row['name'], row['ip_address']
+        if not _text(name) or name not in running:
+            raise ValueError('Incus guest address is not for a running instance in the inventory')
+        pairs.add((name, str(_guest_ip(address))))
+    return _address_projection(scope, timestamp, pairs)
+
+
 def _snapshot(path, scope):
     try:
         with open(path, encoding='utf-8') as stream:
@@ -128,8 +162,15 @@ def _snapshot(path, scope):
     instances = export.get('instances')
     if outcome == 'failed' and instances != []:
         raise ValueError('failed Incus snapshot must have an empty instances array')
-    return dict(section='instances', outcome=outcome, timestamp=timestamp,
-                records=_instance_records(instances, project))
+    records = _instance_records(instances, project)
+    sections = [dict(section='instances', outcome=outcome, timestamp=timestamp, records=records)]
+    if 'guest_addresses' in export:
+        if outcome == 'failed':
+            raise ValueError('failed Incus snapshot cannot include guest addresses')
+        capture = _guest_address_capture(export['guest_addresses'], scope, records)
+        sections.append(dict(section='guest_addresses', outcome='partial',
+                             timestamp=capture['timestamp'], records=capture['records']))
+    return sections
 
 
 def _metric_labels(line, pos):
@@ -253,46 +294,132 @@ def collect(config):
         raise ValueError('Incus collection needs snapshot_path or metrics_path')
     sections = []
     if snapshot is not None:
-        sections.append(_snapshot(snapshot, scope))
+        sections.extend(_snapshot(snapshot, scope))
     if metrics is not None:
         sections.append(_metrics(metrics, scope, config.get('metrics_timestamp')))
     return sections
 
 
-def _export_document(body, scope, timestamp):
+def _export_document(body, scope, timestamp, *, guest_addresses=None):
     if not isinstance(body, dict) or body.get('type') != 'sync' or body.get('status_code') != 200:
         raise ValueError('Incus inventory response was not successful')
     project = _project(scope)
     _check_project(body, project)
     instances = []
-    for record in _instance_records(body.get('metadata'), project):
+    inventory = _instance_records(body.get('metadata'), project)
+    for record in inventory:
         config = {key: record[field] for key, field in zip(_LIMITS, ('cpu', 'memory'))
                   if record[field] is not None}
         instances.append(dict(name=record['name'], type=record['kind'], status=record['state'],
                               expanded_config=config,
                               **{key: record[key] for key in _INSTANCE_DETAILS if key in record}))
-    return dict(source='incus-operator-export', scope=scope, timestamp=timestamp,
-                outcome='complete', instances=instances)
+    export = dict(source='incus-operator-export', scope=scope, timestamp=timestamp,
+                  outcome='complete', instances=instances)
+    if guest_addresses is not None:
+        export['guest_addresses'] = _guest_address_capture(guest_addresses, scope, inventory)
+    return export
 
 
-def _export(remote, scope, output):
-    # Only the explicit operator CLI invokes Incus. Imported collection is offline.
+def _query(target, label, *, timeout=None):
     import subprocess
+
+    try:
+        response = subprocess.run(['incus', 'query', target, '--raw'], check=True, timeout=timeout,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        return json.loads(response.stdout, object_pairs_hook=_object)
+    except (OSError, ValueError, RecursionError, subprocess.SubprocessError):
+        raise ValueError(f'Incus {label} read failed') from None
+
+
+def _capture_time():
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def _state_addresses(body, project):
+    if not isinstance(body, dict) or body.get('type') != 'sync' or body.get('status_code') != 200:
+        raise ValueError('Incus guest state response was not successful')
+    _check_project(body, project)
+    state = body.get('metadata')
+    if (not isinstance(state, dict) or state.get('status') != 'Running'
+            or state.get('status_code') != 103 or not isinstance(state.get('network'), dict)):
+        raise ValueError('Incus guest state has no running network metadata')
+    _check_project(state, project)
+    for interface in state['network'].values():
+        if not isinstance(interface, dict) or not isinstance(interface.get('addresses'), list):
+            continue
+        for row in interface['addresses']:
+            if not isinstance(row, dict):
+                continue
+            try:
+                address = _guest_ip(row.get('address'))
+            except ValueError:
+                continue
+            if row.get('family') == ('inet' if address.version == 4 else 'inet6'):
+                yield str(address)
+
+
+def _selected_guest_addresses(remote, project, export, selection):
+    import sys
+    from urllib.parse import quote, urlencode
+
+    running = {row['name'] for row in export['instances'] if row['status'].casefold() == 'running'}
+    seen = set()
+    paths = []
+    for name in selection:
+        if not _text(name) or name in ('.', '..') or name not in running:
+            raise ValueError('each selected guest must exactly name a running instance in scope')
+        if name in seen:
+            raise ValueError('duplicate guest address instance selection')
+        seen.add(name)
+        try:
+            paths.append((name, quote(name, safe='')))
+        except UnicodeError:
+            raise ValueError('invalid guest address instance path') from None
+
+    project_query = urlencode({'project': project})
+    timestamp = _capture_time()
+    pairs = set()
+    unavailable = 0
+    for name, path in paths:
+        target = f'{remote}:/1.0/instances/{path}/state?{project_query}'
+        try:
+            addresses = _state_addresses(_query(target, 'guest state', timeout=30), project)
+            pairs.update((name, ip) for ip in addresses)
+        except ValueError:
+            unavailable += 1
+    if unavailable:
+        print(f'Incus guest address warning: state unavailable for {unavailable} selected instance(s)',
+              file=sys.stderr)
+    if pairs:
+        export['guest_addresses'] = _address_projection(export['scope'], timestamp, pairs)
+
+
+def _export(remote, scope, output, *, guest_state_path=None, guest_address_instances=()):
+    # Only the explicit operator CLI invokes Incus. Imported collection is offline.
     from tempfile import NamedTemporaryFile
     from urllib.parse import urlencode
 
     if not _text(remote) or remote.startswith('-') or ':' in remote or '/' in remote:
         raise ValueError('expected an explicit Incus remote alias')
-    query = urlencode({'recursion': 1, 'project': _project(scope)})
+    if guest_state_path is not None and guest_address_instances:
+        raise ValueError('saved guest addresses and guest instance reads are mutually exclusive')
+    guest_addresses = None
+    if guest_state_path is not None:
+        try:
+            with guest_state_path.open(encoding='utf-8') as stream:
+                guest_addresses = json.load(stream, object_pairs_hook=_object)
+        except (OSError, ValueError, RecursionError):
+            raise ValueError('cannot read approved Incus guest address JSON') from None
+        if not isinstance(guest_addresses, dict):
+            raise ValueError('invalid scoped Incus guest address capture')
+    project = _project(scope)
+    query = urlencode({'recursion': 1, 'project': project})
     target = f'{remote}:/1.0/instances?{query}'
-    timestamp = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
-    try:
-        response = subprocess.run(['incus', 'query', target, '--raw'], check=True,
-                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        body = json.loads(response.stdout, object_pairs_hook=_object)
-    except (OSError, ValueError, RecursionError, subprocess.CalledProcessError):
-        raise ValueError('Incus inventory read failed') from None
-    export = _export_document(body, scope, timestamp)
+    timestamp = _capture_time()
+    body = _query(target, 'inventory')
+    export = _export_document(body, scope, timestamp, guest_addresses=guest_addresses)
+    if guest_address_instances:
+        _selected_guest_addresses(remote, project, export, guest_address_instances)
     temporary = None
     try:
         with NamedTemporaryFile(mode='w', encoding='utf-8', dir=output.parent, delete=False) as stream:
@@ -315,9 +442,15 @@ def _main():
     parser.add_argument('--output', required=True, type=Path, help='private destination JSON file')
     parser.add_argument('--confirm-whole-project', required=True, action='store_true',
                         help='confirm that the remote and identity cover the entire approved project')
+    guest_addresses = parser.add_mutually_exclusive_group()
+    guest_addresses.add_argument('--guest-addresses-state', type=Path,
+                                 help='explicitly approved, fixed-field runtime address capture JSON')
+    guest_addresses.add_argument('--guest-address-instance', action='append', default=[], metavar='NAME',
+                                 help='read runtime addresses for this exact running instance; repeat to select more')
     args = parser.parse_args()
     try:
-        _export(args.remote, args.scope, args.output)
+        _export(args.remote, args.scope, args.output, guest_state_path=args.guest_addresses_state,
+                guest_address_instances=args.guest_address_instance)
     except ValueError as error:
         parser.exit(2, f'Incus export error: {error}\n')
     except OSError:

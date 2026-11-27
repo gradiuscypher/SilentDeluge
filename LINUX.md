@@ -27,7 +27,7 @@ Create a private configuration file, for example:
 python3 collection.py linux --config /path/to/private/linux.json
 ```
 
-The sample selects every available pack; remove the entries you have not
+The sample excludes address disclosure. Remove any entries you have not
 approved. Omit `packs` or set it to `[]` to collect nothing. Keep `scope`
 unique to the enrolled guest and stable across renames and host moves. The
 optional `asset` appears in each record and defaults to `scope`. Neither is
@@ -137,10 +137,11 @@ from the report. The packs are independent and are not an atomic snapshot.
 
 This is guest evidence, distinct from hosting-provider inventory. An Incus
 [fixed-field scan](examples/complete.json) describes instance kind, status and
-effective configured limits, not what the guest is running or using. Placement
-and matching between provider records and enrolled guests are not inferred.
+effective configured limits, not what the guest is running or using. Linking a
+guest to a provider record requires [placement or address evidence](RELATIONSHIPS.md).
 
-The collector does not spawn subprocesses, read shadow files, collect
-credentials, inspect process command lines or environments, discover guests or
-peers, use SSH, or invoke guest exec. There is no collector-side network
+The opt-in `addresses` pack invokes `ip -j address show` in the local namespace.
+No pack reads shadow files, collects
+credentials, inspects process command lines or environments, discovers guests or
+peers, uses SSH, or invokes guest exec. There is no collector-side network
 transport or upload.

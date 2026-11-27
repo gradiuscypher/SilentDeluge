@@ -7,6 +7,8 @@ Start with the [collection guide](COLLECTION.md) to select a configured source. 
 - [Milestone plan](PLAN.md): first deliverable, local verification, and the public/private boundary.
 - [Domain glossary](CONTEXT.md): agreed meanings and constraints for inventory, permissions, monitoring, and evidence.
 - [Incus provider setup handoff](INCUS-SETUP.md): private identity provisioning, verification, and one-scan acceptance.
+- [Workspace](WEB.md) and [access model](ACCESS.md): sign in, browse a class of evidence, understand effective grants and preview collector setup.
+- [Agent maintenance](AGENT-MAINTENANCE.md): update enrollment, platform and orchestration instructions whenever their contracts change.
 - [MIT license](LICENSE): license for original project material.
 
 ## Inventory from saved metrics

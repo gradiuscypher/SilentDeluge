@@ -1,10 +1,13 @@
 """Collect explicitly enabled, local Linux guest evidence without elevated access."""
 
 from contextlib import contextmanager, ExitStack
+from ipaddress import ip_address
+import json
 import os
 from pathlib import Path
 import re
 import socket
+import subprocess
 import sys
 from time import monotonic, sleep
 
@@ -385,9 +388,37 @@ def _network_links(config):
     return records
 
 
+def _addresses(_config):
+    # One unprivileged netlink dump in the current namespace; no probes or DNS.
+    try:
+        result = subprocess.run(['ip', '-j', 'address', 'show'], check=True, timeout=10,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        interfaces = json.loads(result.stdout)
+    except (subprocess.SubprocessError, RecursionError):
+        raise ValueError('local interface addresses unavailable') from None
+    if not isinstance(interfaces, list):
+        raise ValueError('invalid local interface address dump')
+    addresses = set()
+    for interface in interfaces:
+        if not isinstance(interface, dict) or not isinstance(rows := interface.get('addr_info'), list):
+            raise ValueError('invalid local interface address list')
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError('invalid local interface address')
+            family, local = row.get('family'), row.get('local')
+            if family not in ('inet', 'inet6') or not isinstance(local, str) or '%' in local:
+                raise ValueError('invalid local interface address')
+            address = ip_address(local)
+            if address.version != (4 if family == 'inet' else 6):
+                raise ValueError('local interface address family mismatch')
+            if not (row.get('tentative') or row.get('dadfailed')):
+                addresses.add(str(address))
+    return [dict(ip_address=address) for address in sorted(addresses)]
+
+
 _COLLECTORS = dict(packages=_packages, cpu=_cpu, memory=_memory, disk=_disk,
                    users=_users, interfaces=_interfaces, system=_system, storage=_storage,
-                   services=_services, network_links=_network_links)
+                   services=_services, network_links=_network_links, addresses=_addresses)
 
 
 def collect(config):

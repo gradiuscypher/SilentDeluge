@@ -1,6 +1,6 @@
 # Local inventory web app
 
-Python 3.11+, standard library only. The app listens on **`127.0.0.1` only**. By default, open the exact HTTP URL it prints: `localhost` and other hostnames are not accepted. For remote browser access, use the explicit [same-host TLS reverse proxy mode](#serve-behind-a-same-host-tls-reverse-proxy); do not expose the backend by port forwarding. To switch accounts in a browser, use separate browser profiles or close the private browsing session; HTTP Basic has no app logout button.
+Python 3.11+, standard library only. The app listens on **`127.0.0.1` only**. By default, open the exact HTTP URL it prints; `localhost` and other hostnames are not accepted. For remote browser access, use [same-host TLS reverse proxy mode](#serve-behind-a-same-host-tls-reverse-proxy); do not expose the backend by port forwarding.
 
 ## Start with two synthetic users
 
@@ -55,6 +55,26 @@ unset alice_hash bob_hash
 python3 web_inventory.py serve --config "$private/web.json" --port 8765
 ```
 
+## Sign in and use the workspaces
+
+Open the printed URL and submit a configured username and password at `/login`. To switch accounts, choose **Log out**, then sign in as the other user. Logging out revokes that browser session immediately without changing evidence or view preferences. Sessions expire after eight hours, are cleared by a server restart, and are limited to eight per account (the oldest is revoked first). The browser cookie is host-only, `HttpOnly`, and `SameSite=Strict`; it also has `Secure` in HTTPS mode.
+
+Five failed sign-ins in 30 seconds trigger `429` with `Retry-After` until that window ends. Blocked retries do not extend the window, revoke active sessions, or block other accounts. A sustained stream of failures can still delay new sign-ins for the targeted account.
+
+| Path | Workspace |
+| --- | --- |
+| `/` | Overview: scope-filtered counts and freshness |
+| `/machines` | Linux machine evidence |
+| `/incus` | Incus instance evidence and declaration comparison |
+| `/unifi` | UniFi device and client evidence |
+| `/relationships` | Relationships supported by approved evidence |
+| `/collectors` | Source enablement, collection permission, and manual collection previews |
+| `/collectors/new` | Review collector requirements; does not add configuration or grants |
+| `/access` | Your effective scope grants |
+| `/patterns` | Synthetic design examples |
+
+Follow workspace links for available source details and section filters. Search and detail parameters cannot expand your scope grants. Anonymous page requests redirect to `/login`; the inventory no longer accepts HTTP Basic credentials.
+
 ## Serve behind a same-host TLS reverse proxy
 
 Opt in to one external HTTPS origin:
@@ -65,8 +85,8 @@ python3 web_inventory.py serve --config "$private/web.json" --port 8765 \
 ```
 
 - Use a lowercase DNS hostname (ASCII, or Punycode for an internationalized name) for browser compatibility. No credentials, IP literals, explicit port (even `:443`), trailing dot, path (even `/`), query, or fragment. The app prints the configured HTTPS URL but still serves plain HTTP only on `127.0.0.1:8765` in this example.
-- Terminate TLS on the same host, on the default HTTPS port with a certificate for that name. Route only the configured hostname to the loopback backend. Preserve the client's `Host: inventory.example.test` and pass `Origin` through unchanged when present; never add or rewrite `Origin` to make a request pass. Do not log Basic credentials or cache inventory responses.
-- The app compares `Host` exactly on every GET and POST, and requires the exact `Origin: https://inventory.example.test` on POSTs. Missing or mismatched values fail; `Forwarded` and all `X-Forwarded-*` headers are ignored. Authentication, CSRF tokens, and scope grants are unchanged. Omit `--public-origin` to use the original loopback HTTP origin.
+- Terminate TLS on the same host, on the default HTTPS port with a certificate for that name. Route only the configured hostname to the loopback backend. Preserve the client's `Host: inventory.example.test` and pass `Origin` through unchanged; never add or rewrite `Origin` to make a request pass. Do not log sign-in bodies or session cookies, or cache inventory responses.
+- The app compares `Host` exactly on every GET and POST, and requires the exact `Origin: https://inventory.example.test` on every POST, including sign-in. Missing or mismatched values fail; `Forwarded` and all `X-Forwarded-*` headers are ignored. Omit `--public-origin` to use the loopback HTTP origin without `Secure` cookies.
 
 ## Private configuration and permissions
 
@@ -75,7 +95,8 @@ python3 web_inventory.py serve --config "$private/web.json" --port 8765 \
 - `sources` is the server allowlist. Each ID fixes the `provider` (`incus`, `unifi`, or `linux`), exact `scope`, operator-authored `read` description, and provider `config`. Put the scope on the source, not inside `config`. For collectable sources, the preview shows `read`: describe the actual approved reads, not paths, credentials, or other secrets. Use only read-only provider setups from [COLLECTION.md](COLLECTION.md); use absolute paths for any configured files. Requests can select an allowed source ID, never a file path, endpoint, command, or provider. Use `{}` for an empty installation.
 - Set `"import_only": true` and `"config": {}` for evidence collected elsewhere. Keep a `read` description of the source for operators. The card shows that collection is disabled, and the server refuses preview and collect even for an enabled viewer with `collect_scopes` for that scope. Scope grants and per-user enablement still control who can view evidence. The default is `import_only: false`.
 - `declarations` is optional and only used for Incus instance comparisons. It can be inlined in the matching scope using the offline declaration shape (`source`, `scope`, `timestamp`, `containers`, `vms`). Inventory works without declarations; even with them, runtime sightings do not establish instance absence.
-- Enable and disable affect viewing only. For a collectable source, an enabled viewer with a collection grant can preview one manual read before confirming it. The preview states the allowed read, scope, and evidence destination. Confirmation expires after five minutes, is single-use, and never starts probes, schedules, guest access, or other monitoring. Browser POSTs need the exact served `Origin` (loopback HTTP by default, configured HTTPS in proxy mode) and an account-specific CSRF token. No request adds grants.
+- `network_domain` is an optional, opaque identifier (1–128 printable characters, no leading or trailing whitespace). Use the same exact identifier only for sources explicitly approved to share an addressing domain. No domain is inferred from a scope, network name, or address. `placement` is an optional object containing exactly `scope` (a configured Incus source scope) and `name` (the instance name, 1–256 printable characters, no leading or trailing whitespace). A placement is available only to viewers granted both scopes. For example, a Linux guest source can set `"placement": {"scope": "theatre/stage", "name": "paper-moon"}`. Omit either optional field rather than setting it to `null`.
+- Enable and disable affect viewing only. For a collectable source, an enabled viewer with a collection grant can preview one manual read before confirming it. The preview states the allowed read, scope, and evidence destination. Confirmation is tied to the session that requested the preview, expires after five minutes, is single-use, and never starts probes, schedules, guest access, or other monitoring. `POST /enable`, `/disable`, `/preview`, and `/collect` require the exact served `Origin`, a session cookie, and the session's `csrf` field. `POST /logout` requires the same protections and no source. No request adds grants.
 - The private `inventory.sqlite3` store retains per-user view preferences and per-source evidence across restarts. Evidence is shared only with enabled viewers granted that scope. The most recently processed attempt and its section outcomes are separate from the last verified complete capture and its age. Partial sightings are shown separately. Failed, partial, omitted, and replayed sections do not replace verified complete evidence or establish absence. Only an accepted complete instance capture can establish an omitted declaration's absence in that population and scope, as of its capture time.
 
 ## Import approved evidence offline
@@ -113,10 +134,10 @@ python3 web_inventory.py import-evidence --config "$private/web.json" \
   --source guest-baseline --file /private/guest-envelope.json
 ```
 
-- `--source` is the configured ID, not the envelope's provider name. Import is also available for collectable sources. It writes to the same private database without a server restart or SQL commands; it does not enable any viewer. After enabling the source, reload the dashboard to see subsequent imports.
+- `--source` is the configured ID, not the envelope's provider name. Import is also available for collectable sources. It writes to the same private database without a server restart or SQL commands; it does not enable any viewer. After enabling the source in **Collectors**, reload its provider workspace to see subsequent imports.
 - Import requires the exact version-1 `collection.py` envelope, with `source` matching the configured provider and `scope` matching exactly. The envelope timestamp and any section timestamps need explicit UTC offsets. Section names must be distinct; outcomes must be `complete`, `partial`, or `failed`; records must be objects, and failed sections must have no records. Complete Incus instance rows need unique instance names, kind, and state; effective limits, when set, are strings. Additional record fields are retained. Invalid input exits `2` without updating evidence. These checks enforce the contract, not the origin or truth of a report; import only approved files.
 - A section's timestamp takes precedence over the envelope timestamp; otherwise the envelope timestamp is the capture time. Import never dates evidence with the import time. Equal or older section captures do not replace retained evidence. Empty, failed, or partial reports are not evidence that omitted things are absent. The import command never invokes a provider or falls back to a live read. There is no HTTP import, upload, path selection, guest access, or schedule.
-- The browser shows row counts, capture times, and Linux usage units (seconds, percent, cores, and bytes). Incus declaration comparison is separate from the full observed rows, so it does not hide provider context. A dash means a field was omitted; `null`, `false`, zero, and empty strings (`""`) are distinct. Package rows are collapsed by default behind a keyboard-operable **Show … packages** disclosure. Expanding it reveals the whole capture, not a sample; all rows are delivered in the authenticated response.
+- Provider workspaces present capture times and typed evidence rather than raw JSON. Follow section links for more detail, including paginated Linux installed packages and the Incus comparison. Declaration comparison is separate from observed rows; it does not hide provider context.
 
 ## Acceptance on synthetic inputs
 
@@ -128,30 +149,8 @@ python3 -m unittest -v test_web_inventory
 
 Browser acceptance at `http://127.0.0.1:8765`:
 
-1. Open as Alice. Only `stage` appears; enable its view and verify **Not connected**. Open **Preview one collection**. Check the configured read, exact scope, permission, and local evidence destination. Return to inventory without confirming and verify it is still disconnected.
-2. Preview again, then select **Collect once**. Verify `paper-moon` disagrees on CPU, `tin-piano` is absent, and evidence cites `stage`, `theatre/stage`, and the original capture time and age. Do not use a new capture timestamp merely to refresh old evidence.
-3. In the setup shell after stopping the server, copy `"$private/stage-failed.json"` over `"$private/stage.json"` and restart with the same command. Preview and collect again. The section reports failure, `paper-moon` is stale with its original observed fields and timestamp, and `tin-piano` is unknown, not absent. Disabling the view hides those records; re-enabling restores them without collecting.
-4. Open as Bob in a separate profile or private session. Only `booth` appears. Enable, preview, and collect; `sound-mixer` is observed without declarations. No stage source, scope, records, or actions are exposed. `/patterns` displays synthetic examples; `/style.css` serves the local stylesheet without external resources.
-5. For empty first-run behavior, stop the server and start with a new `0700` state directory and `"sources": {}` while keeping the users. Sign in and verify no sources are available; there is no prompt to create declarations or run a discovery scan.
-6. With the import-only example sources configured, use approved synthetic envelopes with distinguishable capture times. Verify imported rows are hidden before enabling; Incus context is visible alongside any comparison; the package disclosure expands with Enter or Space and includes the last row; zero usage and null limits are not blanks. Verify the import-only card has no preview, including for a collector account. The automated scenarios also check direct preview/collect denial, no provider fallback, invalid imports, and stale evidence after partial, failed, omitted, and replayed sections. They do not test live collection, transport, or deployments.
-
-### CLI smoke: submit the same forms with curl
-
-Run in a second terminal against a fresh synthetic startup. `--user alice` prompts for the password; do not put the password on the command line. The first GET must return `401`, both mutating requests (`enable` and `collect`) must return `303`, and the final GET must show `paper-moon` and `tin-piano`.
-
-```sh
-origin=http://127.0.0.1:8765
-curl --noproxy '*' -isS "$origin/"
-dashboard=$(curl --noproxy '*' -fsS --user alice "$origin/")
-csrf=$(printf '%s\n' "$dashboard" | grep -o 'name="csrf" value="[^"]*"' | head -n 1 | cut -d '"' -f 4)
-curl --noproxy '*' -isS --user alice -H "Origin: $origin" \
-  --data-urlencode "csrf=$csrf" --data 'source=stage' "$origin/enable"
-preview=$(curl --noproxy '*' -fsS --user alice -H "Origin: $origin" \
-  --data-urlencode "csrf=$csrf" --data 'source=stage' "$origin/preview")
-printf '%s\n' "$preview" | grep -E 'Configured read|Evidence destination'
-confirmation=$(printf '%s\n' "$preview" | grep -o 'name="preview" value="[^"]*"' | cut -d '"' -f 4)
-curl --noproxy '*' -isS --user alice -H "Origin: $origin" \
-  --data-urlencode "csrf=$csrf" --data 'source=stage' \
-  --data-urlencode "preview=$confirmation" "$origin/collect"
-curl --noproxy '*' -fsS --user alice "$origin/" | grep -E 'paper-moon|tin-piano'
-```
+1. Sign in as Alice. In **Collectors**, only `stage` appears. Enable its view and preview one collection. Check the configured read, exact scope, permission, and evidence destination. Return to **Collectors** without confirming; **Incus** must still have no capture.
+2. Preview again and choose **Collect once**. Open `stage` in **Incus** and check its declaration comparison: `paper-moon` disagrees on CPU, and `tin-piano` is absent as of the complete capture. Do not change a capture timestamp merely to refresh old evidence.
+3. Stop the server, copy `"$private/stage-failed.json"` over `"$private/stage.json"`, and restart. Sign in and collect again. The comparison must show `paper-moon` as stale and `tin-piano` as unknown, not absent. Disabling the evidence view hides the evidence; re-enabling restores it without collecting.
+4. Use **Log out**, then sign in as Bob in the same browser. Only `booth` appears in **Collectors**. Enable, preview, and collect; `sound-mixer` is observed without declarations. No stage source, scope, records, or actions are exposed.
+5. With a fresh private state directory and `"sources": {}`, sign in and verify no sources are available and no discovery is prompted. With import-only sources, verify imports appear only after enabling, and that manual collection is unavailable even with a collection grant.
