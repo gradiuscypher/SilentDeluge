@@ -30,7 +30,7 @@ Use Python 3.11+ at `/usr/bin/python3`, systemd 249+ with cgroup v2 and kernel s
    PUBLIC_ORIGIN=https://inventory.example.com
    ```
 
-5. In nginx, use a dedicated HTTPS virtual host for that authority, with a valid certificate and unmatched hosts routed elsewhere or rejected. Do not serve the app or accept its Basic credentials over plaintext HTTP. Example `location` inside that HTTPS virtual host:
+5. In nginx, use a dedicated HTTPS virtual host for that authority, with a valid certificate and unmatched hosts routed elsewhere or rejected. Do not serve the app or accept sign-in over plaintext HTTP. Example `location` inside that HTTPS virtual host:
 
    ```nginx
    location / {
@@ -46,7 +46,7 @@ Use Python 3.11+ at `/usr/bin/python3`, systemd 249+ with cgroup v2 and kernel s
    }
    ```
 
-   Preserve the browser's `Origin` and `Authorization` headers; nginx passes them by default. Never synthesize `Origin` from the configured public origin: the application checks the browser's value on POST. Do not log authorization headers or request bodies. Apply the nginx configuration using your site's normal reload procedure.
+   Preserve the browser's `Origin` and `Cookie` request headers and the application's `Set-Cookie` response header; nginx passes them by default. Never synthesize `Origin` from the configured public origin: the application checks the browser's value on every POST, including sign-in and logout. Do not log cookies or request bodies. Apply the nginx configuration using your site's normal reload procedure.
 
 6. Install and start the unit as root from the release source:
 
@@ -56,7 +56,7 @@ Use Python 3.11+ at `/usr/bin/python3`, systemd 249+ with cgroup v2 and kernel s
    systemctl enable --now silentdeluge-web.service
    ```
 
-   Open the configured HTTPS URL and confirm it prompts for app authentication, accepts a configured account and serves only that account's permitted sources. If startup fails, inspect `journalctl -u silentdeluge-web.service` on the server. Do not share private config or logs unredacted.
+   Open the configured HTTPS URL without a session. The app redirects to `/login`; submit a configured username and password and confirm the workspace shows only that account's permitted sources. Select **Log out** and confirm that the app returns to `/login` and a new workspace request redirects there again. Logout revokes that browser session. If startup fails, inspect `journalctl -u silentdeluge-web.service` on the server. Do not share private config or logs unredacted.
 
 ## Update and roll back
 
@@ -70,6 +70,6 @@ ln -sT -- "releases/$release" /opt/silentdeluge/current.next &&
   systemctl start silentdeluge-web.service
 ```
 
-Confirm sign-in over HTTPS and, with a permitted account, that an inventory view can be enabled or disabled. Do not trigger a collection just to verify deployment.
+Confirm HTTPS sign-in and logout as above. While signed in with a permitted account, confirm an inventory view can be enabled or disabled. Do not trigger a collection just to verify deployment.
 
 To roll back, stop the unit, set `release` to the recorded previous release ID, and use the same link swap and start procedure. Restore the previous unit or matching origin/nginx settings before starting if they changed. Keep the on-disk state if it is compatible with the previous release. If the previous release cannot read it, preserve a separate copy of the stopped state and restore the pre-update backup with the original ownership and modes before starting. Restoring that backup discards writes made since it was taken. Confirm the same HTTPS flow after rollback.

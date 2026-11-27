@@ -15,6 +15,42 @@ The runner writes one JSON envelope to stdout: `schema_version` (`1`),
 collection time), and `sections`. Collection produces evidence, not a comparison
 or a persisted inventory. Keep real configuration and evidence out of Git.
 
+## Choose the source by the question
+
+| Question | Provider and placement | Scope and authority | Setup and limitations |
+|---|---|---|---|
+| Which guests exist? What did the hypervisor configure? | `incus`: operator exports from the Incus side; the consumer reads a fixed-field file. A separate metrics capture supplies running sightings. | One named server/project. Whole-project visibility is required for absence. Metrics-only TLS grants no guest or inventory API access. | [Incus setup, example commands, certificate lifecycle](INCUS-SETUP.md) |
+| What is installed or in use **inside** a guest? | `linux`: run unprivileged inside each enrolled VM or container, independent of hosting provider. Transfer the resulting envelope, not the host login. | One stable enrolled asset. Enable only the requested packs; procfs and cgroup counters describe different resource views. | [Linux packs, input paths, units and coverage](LINUX.md) |
+| Which equipment and clients did a network controller see? | `unifi`: read the configured local Network Integration API with verified TLS. | One approved console/site. Use a dedicated read-only key; optional device detail/statistics do not broaden the base population. A missing client is not absent. | [UniFi setup, supported API, pagination and revocation](UNIFI.md) |
+
+An association between these observations grants no additional collection.
+Keeping a source disconnected is a valid setup outcome when identity or trust
+cannot be established.
+
+## When an operator asks an agent to enroll a source
+
+1. Identify the question, provider, exact scope, read locations, sections,
+   permissions, retention destination and whether the request is one-time or
+   recurring. Reuse an existing approved mapping where possible. A declaration
+   or discovery is not a collection grant.
+2. Read the provider guide above. Verify the source endpoint/host and the
+   effective read-only identity before transmitting credentials. Use operator-
+   controlled export where a consumer identity cannot enforce the necessary
+   restrictions. Keep real keys, targets, mappings and reports outside Git.
+3. Create the private config and make one accepted read using the approved
+   identity. Inspect section outcomes, field **units**, capture times and scope;
+   compare against the source's own view privately. An exit code is not evidence
+   of complete coverage. Never change the source system to manufacture a test.
+4. For saved reports, configure the corresponding import-only source and follow
+   [the operator import procedure](WEB.md). Imported remote evidence must not
+   enable local collection on the web server. Confirm a permitted user sees
+   the right source, an unpermitted user cannot discover it through links or
+   search, and replay doesn't give an old sighting a new date.
+5. Record the private owner, config/reference locations, credential expiration,
+   revocation instructions and gaps. Share only sanitized capability and
+   verification status on GitHub. Scheduling, adding new packs, tracking a
+   replacement asset and granting more users access are separate decisions.
+
 ## Adding a provider
 
 1. Add a standard-library module named `source_<name>.py` and register its CLI

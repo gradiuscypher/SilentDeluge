@@ -5,14 +5,19 @@ plain-text title and trusted HTML for the main content. Include one `<h1>` in
 that content and escape every value interpolated into it. The shell supplies the
 site header, main landmark, skip link and stylesheet. Reserve `main-content` as
 the shell's skip target.
+The workspace renderer owns its navigation, including the link to `/patterns`.
+The shell intentionally does not add a second menu or a second patterns link.
 
-Return `web_design.patterns()` from `GET /patterns` when wiring the HTTP layer.
-The pattern page uses the same shell and components as application pages; it
-reads no inventory and makes no external requests. Keep `style.css` beside this
-file when distributing the module. `web_design.styles()` returns that CSS; the
-shell embeds it, so a `/style.css` route is not required. If the HTTP layer sets
-a Content Security Policy, allow the exact inline stylesheet by hash rather than
-enabling arbitrary inline styles.
+`GET /patterns` renders `web_design.patterns()` with the same shell and
+components as the workspace. It reads no inventory, runs no scripts, and makes
+no external requests. Keep `style.css` beside this file when distributing the
+module. The shell embeds the exact CSS returned by `web_design.styles()`;
+`web_inventory.py` allows that stylesheet by hash while leaving scripts blocked.
+
+The synthetic scope selector and fragment pager use CSS `:has()`. With no
+support for that selector (or with styles blocked), the page shows the full
+table and both linked result pages without an inactive filter. Provenance uses
+native `<details>` in either case. Workspace filters and pagination use GET.
 
 ## Shared markup
 
@@ -21,8 +26,12 @@ enabling arbitrary inline styles.
 | Report introduction | `<header class="report-header stack">` with an optional `.eyebrow`, the page heading and a `.lede` paragraph. |
 | Report sections | `.stack` spaces children vertically. `.section-heading` groups a heading with a short explanatory paragraph. |
 | Collection cards | `.panel-grid` lays out `.panel` children and collapses to one column as needed. Add `.panel--wide` to a child that should span the grid. |
-| Evidence table | `<table class="data-table">` with a caption and scoped column and row headers. Keep the table narrow enough to wrap at mobile widths. |
-| Provenance | `<details class="disclosure">` with a descriptive `<summary>`, followed by `<dl class="facts">` with grouped terms and descriptions. Use `<time datetime="…">` for observation times. |
+| Navigation | Named `<nav class="workspace-nav">` with links, optionally in a list. Use `aria-current="page"` on the actual current route. |
+| Filter bar | A labeled GET `<form class="filters">` in a `.toolbar`, or a form with both classes. Wrap each label and field in one group. Retain query values on submit and offer a reset link when filters are active. |
+| Result summary | Put `.summary` text before the results: the visible range and total, or an explicit empty message and a way to reset. |
+| Evidence table | Use a native `<table>` with caption and scoped column and row headers. For a genuinely wide table, wrap it in `<div class="table-scroll" role="region" tabindex="0" aria-labelledby="…">` named by its caption. |
+| Pagination | Use a named `<nav class="pagination">` after the results. Link adjacent pages with `rel="prev"` or `rel="next"` and mark the current link with `aria-current="page"`. Carry filters in the links. |
+| Provenance | Use native `<details>` with a descriptive `<summary>` and a `<dl class="facts">`. Put nested fact lists inside a `<dd>`. Use `<time datetime="…">` for observation times. |
 
 Use `web_design.status_badge(state)` for labeled badges. Collection states are
 `complete`, `partial`, `stale`, `disconnected` and `error`; evidence presence is
@@ -44,13 +53,15 @@ heading targets with `tabindex="-1"`.
 ## Verification after integration
 
 1. Run `python3 -m unittest -v test_web_design`.
-2. Open `/patterns` through the application. Confirm all five collection states
-   and the evidence table render without any external network request.
-3. Use only the keyboard: first Tab reveals the skip link; Enter moves focus to
-   main; the next Tab reaches the first in-page link. Follow each in-page link
-   and verify focus reaches its heading. Toggle provenance with Enter or Space,
-   then reverse through the links with Shift+Tab. Check that focus stays visible.
-4. Inspect in both system themes at desktop and 320 CSS pixels wide, including
-   at browser zoom. Confirm the cards reflow, the table remains readable, and
-   the page does not scroll horizontally. Check text and badge contrast (at
-   least 4.5:1) and focus outlines against adjacent surfaces (at least 3:1).
+2. Open `/patterns` through the application with JavaScript disabled. Confirm
+   all five collection states render and no external requests are made. Select
+   each scope and return to All scopes: expect 3, 2, 1, then 0 rows in option order.
+3. Use only the keyboard: the first Tab reveals the skip link; Enter moves focus
+   to main. Follow the section jumps and verify that focus reaches their headings.
+   Toggle provenance with Enter or Space. Follow Next page, then Previous page:
+   focus should move to the displayed result page, and the summary should change.
+4. In both system themes at desktop and 320 CSS pixels wide, including at
+   browser zoom, check that cards, navigation, filters, and pager reflow. Focus
+   the table region and scroll to its last column without horizontal page scroll.
+   Check text and badge contrast (at least 4.5:1) and focus outlines against
+   adjacent surfaces (at least 3:1).

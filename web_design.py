@@ -27,11 +27,6 @@ def page(title: str, body_html: str) -> str:
 
     Callers supply the main heading and escape any untrusted values in body_html.
     """
-    return _page(title, body_html)
-
-
-def _page(title: str, body_html: str, *, patterns_current: bool = False) -> str:
-    current = ' aria-current="page"' if patterns_current else ""
     return f'''<!doctype html>
 <html lang="en">
 <head>
@@ -45,9 +40,6 @@ def _page(title: str, body_html: str, *, patterns_current: bool = False) -> str:
   <header class="site-bar">
     <div class="shell">
       <span class="wordmark">SilentDeluge</span>
-      <nav aria-label="Site">
-        <a href="/patterns"{current}>Design patterns</a>
-      </nav>
     </div>
   </header>
   <main class="shell" id="main-content" tabindex="-1">
@@ -65,15 +57,20 @@ def status_badge(state: str) -> str:
 
 def patterns() -> str:
     """Render the local design reference using synthetic evidence only."""
-    return _page("Inventory patterns", f'''
+    return page("Inventory patterns", f'''
     <div class="patterns stack">
       <header class="report-header stack">
         <p class="eyebrow">Design reference / Synthetic examples</p>
         <h1>Inventory patterns</h1>
         <p class="lede">Show what was observed, where it came from, and what the evidence cannot tell us.</p>
-        <nav class="section-nav" aria-label="On this page">
-          <a href="#collection-states">Collection states</a>
-          <a href="#inventory-evidence">Inventory evidence</a>
+        <p><a href="/">Back to inventory</a></p>
+        <nav class="workspace-nav" aria-label="On this page">
+          <ul>
+            <li><a href="#collection-states">Collection states</a></li>
+            <li><a href="#inventory-evidence">Inventory evidence</a></li>
+            <li><a href="#evidence-detail">Evidence detail</a></li>
+            <li><a href="#paged-results">Paged results</a></li>
+          </ul>
         </nav>
       </header>
 
@@ -116,48 +113,122 @@ def patterns() -> str:
           <h2 id="inventory-evidence" tabindex="-1">Inventory evidence</h2>
           <p>Pair presence with its basis. Keep the observation timestamp attached to the evidence.</p>
         </header>
+        <div class="panel pattern-inventory">
+          <div class="toolbar filters pattern-scope-filter" hidden>
+            <div>
+              <label for="pattern-scope">Scope</label>
+              <select id="pattern-scope">
+                <option value="all">All scopes</option>
+                <option value="main">Main stage</option>
+                <option value="rehearsal">Rehearsal stage</option>
+                <option value="storage">Storage stage</option>
+              </select>
+            </div>
+          </div>
+          <div class="summary" role="status">
+            <p data-example-summary="all">Showing all 3 example instances.</p>
+            <p data-example-summary="main" hidden>Showing 2 of 3 example instances for Main stage.</p>
+            <p data-example-summary="rehearsal" hidden>Showing 1 of 3 example instances for Rehearsal stage.</p>
+            <p data-example-summary="storage" hidden>No matching example instances. Choose All scopes to reset the filter.</p>
+          </div>
+          <div class="table-scroll" role="region" aria-labelledby="example-inventory-caption" tabindex="0">
+            <table>
+              <caption id="example-inventory-caption">Example inventory evidence</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Instance</th>
+                  <th scope="col">Presence</th>
+                  <th scope="col">Scope and basis</th>
+                  <th scope="col">Evidence time</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr data-example-scope="main">
+                  <th scope="row">paper-moon</th>
+                  <td>{status_badge("observed")}</td>
+                  <td>Listed in a complete scan of Main stage.</td>
+                  <td><time datetime="2025-01-01T10:00:00Z">10:00 UTC</time></td>
+                </tr>
+                <tr data-example-scope="main">
+                  <th scope="row">tin-piano</th>
+                  <td>{status_badge("absent")}</td>
+                  <td>Missing from a complete scan of Main stage.</td>
+                  <td><time datetime="2025-01-01T10:00:00Z">10:00 UTC</time></td>
+                </tr>
+                <tr data-example-scope="rehearsal">
+                  <th scope="row">painted-sun</th>
+                  <td>{status_badge("unknown")}</td>
+                  <td>Missing from a partial capture of Rehearsal stage.</td>
+                  <td><time datetime="2025-01-01T10:05:00Z">10:05 UTC</time></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="stack" aria-labelledby="evidence-detail">
+        <header class="section-heading">
+          <h2 id="evidence-detail" tabindex="-1">Evidence detail</h2>
+          <p>Show the finding first. Expand the supporting facts without leaving the page.</p>
+        </header>
         <div class="panel">
-          <table class="data-table">
-            <caption>Example inventory across two scopes</caption>
-            <thead>
-              <tr><th scope="col">Instance</th><th scope="col">Presence</th><th scope="col">Basis</th></tr>
-            </thead>
-            <tbody>
-              <tr>
-                <th scope="row">paper-moon</th>
-                <td>{status_badge("observed")}</td>
-                <td>
-                  Listed in a complete scan of the main stage at
-                  <time datetime="2025-01-01T10:00:00Z">10:00 UTC</time>.
-                </td>
-              </tr>
-              <tr>
-                <th scope="row">tin-piano</th>
-                <td>{status_badge("absent")}</td>
-                <td>
-                  Missing from a complete scan of the main stage at
-                  <time datetime="2025-01-01T10:00:00Z">10:00 UTC</time>.
-                </td>
-              </tr>
-              <tr>
-                <th scope="row">painted-sun</th>
-                <td>{status_badge("unknown")}</td>
-                <td>
-                  Missing from a partial capture of the rehearsal stage at
-                  <time datetime="2025-01-01T10:05:00Z">10:05 UTC</time>.
-                </td>
-              </tr>
-            </tbody>
-          </table>
-          <details class="disclosure">
+          <h3>paper-moon</h3>
+          <p>{status_badge("observed")} in Main stage</p>
+          <details>
             <summary>Observation provenance for paper-moon</summary>
             <dl class="facts">
-              <div><dt>Source</dt><dd>Synthetic instance scan</dd></div>
-              <div><dt>Scope</dt><dd>Main stage</dd></div>
               <div><dt>Observed at</dt><dd><time datetime="2025-01-01T10:00:00Z">1 Jan 2025, 10:00 UTC</time></dd></div>
-              <div><dt>Coverage</dt><dd>Complete for the main stage</dd></div>
+              <div><dt>Coverage</dt><dd>Complete for Main stage</dd></div>
+              <div>
+                <dt>Source</dt>
+                <dd>
+                  Synthetic instance scan
+                  <dl class="facts">
+                    <div><dt>Method</dt><dd>Instance listing</dd></div>
+                    <div><dt>Scope</dt><dd>Main stage</dd></div>
+                  </dl>
+                </dd>
+              </div>
             </dl>
           </details>
         </div>
       </section>
-    </div>''', patterns_current=True)
+
+      <section class="stack pattern-pages" aria-labelledby="paged-results">
+        <header class="section-heading">
+          <h2 id="paged-results" tabindex="-1">Paged results</h2>
+          <p>State the visible range of results and use links for the adjacent pages.</p>
+        </header>
+        <article class="panel" id="pattern-page-1" tabindex="-1" aria-labelledby="example-runs-1">
+          <h3 id="example-runs-1">Example runs · page 1</h3>
+          <p class="summary">Showing 1–2 of 4 example runs.</p>
+          <ul>
+            <li>Main stage scan · <time datetime="2025-01-01T10:00:00Z">10:00 UTC</time></li>
+            <li>Rehearsal stage capture · <time datetime="2025-01-01T10:05:00Z">10:05 UTC</time></li>
+          </ul>
+          <nav class="pagination" aria-label="Example run pages">
+            <ul>
+              <li><a href="#pattern-page-1" aria-label="Page 1" aria-current="page">1</a></li>
+              <li><a href="#pattern-page-2" aria-label="Page 2">2</a></li>
+              <li><a href="#pattern-page-2" rel="next">Next page</a></li>
+            </ul>
+          </nav>
+        </article>
+        <article class="panel" id="pattern-page-2" tabindex="-1" aria-labelledby="example-runs-2">
+          <h3 id="example-runs-2">Example runs · page 2</h3>
+          <p class="summary">Showing 3–4 of 4 example runs.</p>
+          <ul>
+            <li>Main stage scan · <time datetime="2025-01-01T10:10:00Z">10:10 UTC</time></li>
+            <li>Rehearsal stage capture · <time datetime="2025-01-01T10:15:00Z">10:15 UTC</time></li>
+          </ul>
+          <nav class="pagination" aria-label="Example run pages">
+            <ul>
+              <li><a href="#pattern-page-1" rel="prev">Previous page</a></li>
+              <li><a href="#pattern-page-1" aria-label="Page 1">1</a></li>
+              <li><a href="#pattern-page-2" aria-label="Page 2" aria-current="page">2</a></li>
+            </ul>
+          </nav>
+        </article>
+      </section>
+    </div>''')

@@ -1,7 +1,7 @@
 """Serve a private, scope-filtered inventory on IPv4 loopback only."""
 
 import argparse
-from base64 import b64decode, b64encode
+from base64 import b64encode
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -12,6 +12,7 @@ from html import escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib import import_module
 import json
+from math import ceil
 import os
 from pathlib import Path
 import re
@@ -29,6 +30,13 @@ from web_design import page, patterns, styles
 _ID = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}')
 _VERIFIER = re.compile(r'pbkdf2-sha256\$600000\$([0-9a-f]{32})\$([0-9a-f]{64})')
 _TOKEN = re.compile(r'[a-zA-Z0-9_-]{43}')
+_BAD_PERCENT = re.compile(r'%(?![0-9a-fA-F]{2})')
+_COOKIE = 'silentdeluge_session'
+_SESSION_SECONDS = 8 * 60 * 60
+_SESSIONS_PER_USER = 8
+_LOGIN_ATTEMPTS = 5
+_LOGIN_WINDOW = 30
+_PREVIEW_SECONDS = 300
 _DNS_LABEL = re.compile(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?')
 _ITERATIONS = 600_000
 _STATE_NAME = 'inventory.sqlite3'
@@ -38,30 +46,6 @@ _STYLE_HASH = b64encode(sha256(styles().encode('utf-8')).digest()).decode('ascii
 _CSP = (f"default-src 'none'; style-src 'self' 'sha256-{_STYLE_HASH}'; "
         "form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
 
-_SECTION_LABELS = {
-    ('incus', 'instances'): ('Incus instances', 'Instance state, effective limits, and provider context.'),
-    ('incus', 'runtime'): ('Runtime sightings', 'Runtime sightings do not cover the instance inventory.'),
-    ('linux', 'packages'): ('Installed packages', 'Packages recorded by the guest’s selected package manager.'),
-    ('linux', 'cpu'): ('CPU usage', 'Sampled CPU usage in the reported accounting view, not CPU capacity.'),
-    ('linux', 'memory'): ('Memory', 'Usage and capacity in the reported accounting view. '
-                          'A null limit means uncapped at that cgroup.'),
-    ('linux', 'disk'): ('Root filesystem', 'Space usage for the root filesystem, not all guest storage.'),
-    ('linux', 'users'): ('Local accounts', 'Local user names, UIDs, and primary GIDs.'),
-    ('linux', 'interfaces'): ('Network interfaces', 'Names and indices in the observed network namespace.'),
-}
-_FIELD_LABELS = {
-    'incus': {'cpu': 'CPU limit (count or pin set)', 'memory': 'Memory limit (as reported)'},
-    'linux': {
-        'sample_seconds': 'Sample duration (s)',
-        'busy_percent': 'Busy CPU time (%)',
-        'cpu_cores_used': 'Average CPU usage (cores)',
-        'total_bytes': 'Total (bytes)',
-        'used_bytes': 'Used (bytes)',
-        'available_bytes': 'Available (bytes)',
-        'limit_bytes': 'Limit (bytes)',
-    },
-}
-
 
 @dataclass(frozen=True)
 class _User:
@@ -69,7 +53,14 @@ class _User:
     verifier: bytes
     view: frozenset
     collect: frozenset
+
+
+@dataclass
+class _Session:
+    username: str
     csrf: str
+    expires: float
+    preview: tuple[str, str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +72,8 @@ class _Source:
     config: dict
     declarations: dict | None
     import_only: bool
+    network_domain: str | None
+    placement: dict | None
 
     @property
     def key(self):
@@ -163,13 +156,13 @@ def _load_config(path):
         view, collect = _scopes(user['view_scopes']), _scopes(user['collect_scopes'])
         if not _ID.fullmatch(name) or not digest or not collect <= view:
             raise ValueError('invalid credentials or grants')
-        users[name] = _User(bytes.fromhex(digest[1]), bytes.fromhex(digest[2]), view, collect,
-                            token_urlsafe(32))
+        users[name] = _User(bytes.fromhex(digest[1]), bytes.fromhex(digest[2]), view, collect)
     if not isinstance(config['sources'], dict):
         raise ValueError('sources must be an object')
     sources = {}
     for name, source in config['sources'].items():
-        _shape(source, {'provider', 'scope', 'read', 'config'}, {'declarations', 'import_only'})
+        _shape(source, {'provider', 'scope', 'read', 'config'},
+               {'declarations', 'import_only', 'network_domain', 'placement'})
         provider, scope, read, settings = (source[key] for key in ('provider', 'scope', 'read', 'config'))
         import_only = source.get('import_only', False)
         if (not _ID.fullmatch(name) or not isinstance(provider, str) or provider not in _PROVIDERS
@@ -181,8 +174,20 @@ def _load_config(path):
             if provider != 'incus':
                 raise ValueError('declarations are only supported for Incus instances')
             declarations = _declarations(source['declarations'], scope)
+        network_domain = source.get('network_domain')
+        if 'network_domain' in source and (not _text(network_domain) or len(network_domain) > 128):
+            raise ValueError('invalid network domain')
+        placement = source.get('placement')
+        if 'placement' in source:
+            _shape(placement, {'scope', 'name'})
+            if not all(map(_text, placement.values())) or len(placement['name']) > 256:
+                raise ValueError('invalid placement')
         sources[name] = _Source(name, provider, scope, read, dict(settings, scope=scope),
-                                declarations, import_only)
+                                declarations, import_only, network_domain, placement)
+    incus_scopes = {source.scope for source in sources.values() if source.provider == 'incus'}
+    if any(source.placement is not None and source.placement['scope'] not in incus_scopes
+           for source in sources.values()):
+        raise ValueError('placement must reference a configured Incus scope')
     return users, sources, Path(config['state_dir'])
 
 
@@ -308,120 +313,6 @@ def _e(value):
     return escape(str(value), quote=True)
 
 
-def _cell(value):
-    return _e(value if isinstance(value, str) and value else json.dumps(value, ensure_ascii=False))
-
-
-def _table(caption, headers, rows):
-    heading = ''.join(f'<th scope="col">{_e(header)}</th>' for header in headers)
-    return (f'<table class="data-table"><caption>{_e(caption)}</caption><thead><tr>{heading}</tr></thead>'
-            '<tbody>' + ''.join(
-                '<tr>' + ''.join(f'<td>{_cell(value)}</td>' for value in row) + '</tr>' for row in rows
-            ) + '</tbody></table>')
-
-
-def _capture(source, name, label, capture, now):
-    records = capture['records']
-    count = len(records)
-    rows_label = f'{count} {"row" if count == 1 else "rows"}'
-    citation = _citation(source.id, source.scope, capture['timestamp'], now)
-    summary = f'<p>{label}: {citation} — {rows_label}.</p>'
-    if not records:
-        return summary + '<p>No records in this capture.</p>'
-    columns = dict.fromkeys(key for row in records for key in row)
-    if not columns:
-        return summary + '<p>Records have no fields.</p>'
-    field_labels = _FIELD_LABELS.get(source.provider, {})
-    table = _table(label, (field_labels.get(key, key) for key in columns),
-                   ([row.get(key, '—') for key in columns] for row in records))
-    if (source.provider, name) == ('linux', 'packages'):
-        table = (f'<details class="disclosure"><summary>Show {label.lower()} packages ({rows_label})</summary>'
-                 f'{table}</details>')
-    return summary + table
-
-
-def _date(timestamp, now):
-    age = (now - _instant(timestamp)).total_seconds()
-    age_text = f'age {int(age)} s' if age >= 0 else 'timestamp ahead of server clock'
-    return f'<time datetime="{_e(timestamp)}">{_e(timestamp)}</time> ({age_text})'
-
-
-def _citation(source, scope, timestamp, now):
-    return f'{_e(source)} | {_e(scope)} | {_date(timestamp, now)}'
-
-
-def _comparison(source, complete, outcome, now):
-    scans = []
-    if complete:
-        # The Incus provider emits normalized observed fields; compare consumes the
-        # original offline scan shape with effective limits in expanded_config.
-        instances = [dict(name=row['name'], type=row['kind'], status=row['state'],
-                          expanded_config={'limits.cpu': row['cpu'], 'limits.memory': row['memory']})
-                     for row in complete['records']]
-        scans = [dict(source=source.id, scope=source.scope, timestamp=complete['timestamp'],
-                      outcome='complete', instances=instances)]
-    rows = []
-    for row in compare(source.declarations, scans):
-        status = row['status']
-        if outcome not in (None, 'complete'):
-            status = 'stale' if row['observed'] is not None else 'unknown'
-        rows.append((row['name'], status, row['declared'] or '—', row['observed'] or '—',
-                     ', '.join(row['differences']) or '—'))
-    declaration = source.declarations
-    html = '<p>Declarations: ' + _citation(declaration['source'], declaration['scope'],
-                                           declaration['timestamp'], now) + '</p>'
-    if rows:
-        html += _table('Declaration comparison', ('Instance', 'Status', 'Declared', 'Observed', 'Differing fields'),
-                       rows)
-    else:
-        html += '<p>No declared or observed instances.</p>'
-    return html
-
-
-def _inventory(source, state, now):
-    parts = []
-    if source.declarations is None:
-        parts.append('<p>No declarations configured.</p>')
-    if state is None:
-        parts.append('<p>Not connected: no offline evidence imported.</p>' if source.import_only
-                     else '<p>Not connected: no collection attempted.</p>')
-        if source.declarations is not None:
-            parts.append(_comparison(source, None, None, now))
-        return ''.join(parts)
-
-    label = 'Latest processed offline envelope' if state.get('imported') else 'Latest collection'
-    parts.append(f'<p>{label}: {_e(state["outcome"])} — {_date(state["timestamp"], now)}.</p>')
-    names = state['sections'].keys() | ({'instances'} if source.declarations is not None else set())
-    if not names:
-        parts.append('<p>No observations available. Presence is unknown.</p>')
-    for name in sorted(names):
-        title, description = _SECTION_LABELS.get((source.provider, name), (name, ''))
-        parts.append(f'<section class="stack"><h3>{_e(title)}</h3>')
-        if description:
-            parts.append(f'<p>{_e(description)}</p>')
-        result = state['results'].get(name)
-        outcome = result['outcome'] if result else 'not returned'
-        parts.append(f'<p>Latest section outcome: {_e(outcome)}' +
-                     (f' — {_date(result["timestamp"], now)}' if result else '') + '.</p>')
-        if outcome != 'complete':
-            parts.append('<p>Presence of omitted records is unknown.</p>')
-        history = state['sections'].get(name, {})
-        complete, partial = history.get('complete'), history.get('partial')
-        if source.declarations is not None and name == 'instances':
-            parts.append(_comparison(source, complete, outcome, now))
-        if complete:
-            label = 'Complete capture' if outcome == 'complete' else 'Stale — last verified complete capture'
-            parts.append(_capture(source, name, label, complete, now))
-        current_partial = partial and outcome == 'partial' and result['timestamp'] == partial['timestamp']
-        if outcome == 'partial' and not current_partial:
-            parts.append('<p>No sightings in this partial capture (0 rows).</p>')
-        if partial:
-            label = 'Partial sightings' if current_partial else 'Stale — retained partial sightings'
-            parts.append(_capture(source, name, label, partial, now))
-        parts.append('</section>')
-    return ''.join(parts)
-
-
 def _document(title, content):
     return page(title, f'<div class="patterns stack"><header class="report-header">'
                        f'<h1>{_e(title)}</h1></header>{content}</div>')
@@ -431,55 +322,61 @@ def _hidden(name, value):
     return f'<input type="hidden" name="{name}" value="{_e(value)}">'
 
 
-def _form(action, source, user, label, preview=None):
-    fields = _hidden('csrf', user.csrf) + _hidden('source', source.id)
-    if preview is not None:
-        fields += _hidden('preview', preview)
-    return f'<form method="post" action="/{action}">{fields}<button type="submit">{label}</button></form>'
+def _login_page(error=''):
+    message = f'<p role="alert">{_e(error)}</p>' if error else ''
+    return _document('Sign in', message + '''
+<form method="post" action="/login" class="stack">
+  <label>Username <input name="username" autocomplete="username" required></label>
+  <label>Password <input type="password" name="password" autocomplete="current-password" required></label>
+  <button type="submit">Sign in</button>
+</form>''')
 
 
 def _may_collect(source, user):
     return not source.import_only and source.scope in user.collect
 
 
-def _dashboard(db, username, user, sources):
-    visible = [source for source in sources.values() if source.scope in user.view]
-    body = [f'<p>Signed in as <strong>{_e(username)}</strong>.</p>']
-    if not visible:
-        body.append('<p>No sources are available in your scopes.</p>')
-    now = datetime.now(timezone.utc)
-    for source in visible:
+def _workspace_entries(db, username, user, sources):
+    entries = []
+    for source in sources.values():
+        if source.scope not in user.view:
+            continue
         enabled = _enabled(db, username, source)
-        allowed = _may_collect(source, user)
-        permission = ('disabled (import-only)' if source.import_only else
-                      'granted' if allowed else 'not granted')
-        body.append(f'<section class="panel" id="{_e(source.id)}"><h2>{_e(source.id)}</h2>'
-                    f'<p>Provider: {_e(source.provider)} | Scope: {_e(source.scope)}</p>'
-                    f'<p>Evidence view: {"enabled" if enabled else "disabled"}. '
-                    f'Collection permission: {permission}.</p>')
-        action = 'disable' if enabled else 'enable'
-        body.append(_form(action, source, user, f'{action.capitalize()} evidence view'))
-        if enabled:
-            if allowed:
-                body.append(_form('preview', source, user, 'Preview one collection'))
-            body.append(_inventory(source, _state(db, source), now))
-        body.append('</section>')
-    return ''.join(body)
+        placement = source.placement
+        if placement is not None and placement['scope'] not in user.view:
+            placement = None
+        entries.append(dict(id=source.id, provider=source.provider, scope=source.scope,
+                            read=source.read, enabled=enabled, can_collect=_may_collect(source, user),
+                            import_only=source.import_only, state=_state(db, source) if enabled else None,
+                            declarations=source.declarations if enabled else None, asset_links=[],
+                            network_domain=source.network_domain, placement=placement))
+    return entries
 
 
-def _preview(source, user, token):
+def _preview(source, csrf, token):
+    fields = _hidden('csrf', csrf) + _hidden('source', source.id) + _hidden('preview', token)
     return (f'<p>Source: {_e(source.id)} | Provider: {_e(source.provider)} | Scope: {_e(source.scope)}</p>'
             f'<p>Configured read: {_e(source.read)}</p>'
             '<p>Permission: one read of this configured source is granted. No probe or schedule is created.</p>'
             f'<p>Evidence destination: private local <code>{_STATE_NAME}</code> store, visible only to '
             'accounts granted this scope with the evidence view enabled.</p>'
             '<p>Nothing has been collected. This preview expires in five minutes.</p>'
-            + _form('collect', source, user, 'Collect once', token)
-            + '<p><a href="/">Return to inventory</a></p>')
+            f'<form method="post" action="/collect">{fields}<button type="submit">Collect once</button></form>'
+            '<p><a href="/collectors">Return to collectors</a></p>')
 
 
 def _matches(expected, provided):
     return bool(_TOKEN.fullmatch(provided) and compare_digest(expected, provided))
+
+
+def _parameters(encoded, *, max_fields):
+    if _BAD_PERCENT.search(encoded):
+        raise ValueError('invalid percent escape')
+    fields = parse_qs(encoded, keep_blank_values=True, strict_parsing=True,
+                      errors='strict', max_num_fields=max_fields)
+    if any(len(values) != 1 for values in fields.values()):
+        raise ValueError('duplicate parameter')
+    return {key: value[0] for key, value in fields.items()}
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -512,118 +409,208 @@ class _Handler(BaseHTTPRequestHandler):
     def _message(self, status, title):
         self._send(status, _document(title, '<p><a href="/">Inventory</a></p>'))
 
-    def _authenticate(self):
-        if self._header('Host') != self.server.authority:
-            self._message(400, 'Invalid Host')
+    def _check_host(self):
+        if self._header('Host') == self.server.authority:
+            return True
+        self._message(400, 'Invalid Host')
+        return False
+
+    def _session_token(self):
+        token = None
+        for cookie in (self._header('Cookie') or '').split(';'):
+            key, _, value = cookie.strip().partition('=')
+            if key == _COOKIE:
+                if token is not None or not _TOKEN.fullmatch(value):
+                    return None
+                token = value
+        return token
+
+    def _session(self, token):
+        session = self.server.sessions.get(token)
+        if session is not None and session.expires <= monotonic():
+            del self.server.sessions[token]
             return None
-        auth = self._header('Authorization') or ''
-        scheme, _, encoded = auth.partition(' ')
-        if scheme.lower() == 'basic' and 0 < len(encoded) <= 1456:
-            try:
-                name, separator, password = b64decode(encoded, validate=True).decode('utf-8').partition(':')
-                if separator:
-                    user = self.server.users.get(name, self.server.unknown_user)
-                    digest = _derive(_password_bytes(password), user.salt)
-                    if compare_digest(digest, user.verifier) and name in self.server.users:
-                        return name, user
-            except ValueError:
-                pass
-        self._send(401, _document('Authentication required', '<p>Sign in with a configured local account.</p>'),
-                   WWW_Authenticate='Basic realm="SilentDeluge", charset="UTF-8"')
-        return None
+        return session
+
+    def _cookie(self, token, age):
+        secure = '; Secure' if self.server.secure_cookie else ''
+        return f'{_COOKIE}={token}; Path=/; Max-Age={age}; HttpOnly; SameSite=Strict{secure}'
+
+    def _login(self, token, form):
+        try:
+            if form is None or form.keys() != {'username', 'password'}:
+                raise ValueError('invalid form fields')
+            username = form['username']
+            if not _ID.fullmatch(username):
+                raise ValueError('invalid username')
+            password = _password_bytes(form['password'])
+        except ValueError:
+            self._send(400, _login_page('Enter a valid username and password.'))
+            return
+
+        user = self.server.users.get(username)
+        # One bucket per configured account and one for all unknown names. A
+        # rejected retry does not move the deadline or affect active sessions.
+        bucket = username if user is not None else None
+        attempts = self.server.login_failures
+        now = monotonic()
+        count, deadline = attempts.get(bucket, (0, 0))
+        if deadline <= now:
+            count, deadline = 0, now + _LOGIN_WINDOW
+        if count >= _LOGIN_ATTEMPTS:
+            self._send(429, _login_page('Too many attempts. Try again shortly.'),
+                       Retry_After=str(ceil(deadline - now)))
+            return
+
+        verifier = user if user is not None else self.server.unknown_user
+        if not compare_digest(_derive(password, verifier.salt), verifier.verifier) or user is None:
+            attempts[bucket] = (count + 1, deadline)
+            self._send(401, _login_page('Invalid username or password.'))
+            return
+
+        attempts.pop(bucket, None)
+        sessions = self.server.sessions
+        sessions.pop(token, None)  # A successful sign-in always rotates any presented session.
+        now = monotonic()
+        for expired in [key for key, session in sessions.items() if session.expires <= now]:
+            del sessions[expired]
+        active = [key for key, session in sessions.items() if session.username == username]
+        if len(active) >= _SESSIONS_PER_USER:
+            del sessions[active[0]]  # Insertion order; one account cannot evict another.
+        token = token_urlsafe(32)
+        sessions[token] = _Session(username, token_urlsafe(32), now + _SESSION_SECONDS)
+        self._send(303, Location='/', Set_Cookie=self._cookie(token, _SESSION_SECONDS))
 
     def _read_form(self):
         if self._header('Content-Type') != 'application/x-www-form-urlencoded' or 'Transfer-Encoding' in self.headers:
             return None
         length = self._header('Content-Length') or ''
-        if not re.fullmatch(r'[0-9]{1,4}', length) or not 1 <= int(length) <= 2048:
+        if not re.fullmatch(r'[0-9]{1,4}', length) or not 1 <= int(length) <= 4096:
             return None
         try:
             data = self.rfile.read(int(length))
-            if len(data) != int(length):
-                return None
-            fields = parse_qs(data.decode('ascii'), keep_blank_values=True, strict_parsing=True,
-                              errors='strict', max_num_fields=3)
+            if len(data) == int(length):
+                return _parameters(data.decode('ascii'), max_fields=3)
         except (ValueError, TimeoutError):
-            return None
-        if all(len(values) == 1 for values in fields.values()):
-            return {key: value[0] for key, value in fields.items()}
+            pass
         return None
 
     def do_GET(self):
-        login = self._authenticate()
-        if login is None:
+        if not self._check_host():
             return
-        if self.path == '/style.css':
+        path, _, raw_query = self.path.partition('?')
+        try:
+            if (not path.startswith('/') or '#' in self.path or not self.path.isascii()
+                    or not self.path.isprintable() or len(raw_query) > 2048):
+                raise ValueError('invalid request target')
+            query = _parameters(raw_query, max_fields=8)
+            if any(not _ID.fullmatch(key) or len(value) > 256 or (value and not value.isprintable())
+                   for key, value in query.items()):
+                raise ValueError('invalid query')
+        except ValueError:
+            self._message(400, 'Invalid request target')
+            return
+        if path == '/style.css':
             self._send(200, styles(), 'text/css; charset=utf-8')
-        elif self.path == '/patterns':
-            self._send(200, patterns())
-        elif self.path == '/':
-            try:
-                with closing(sqlite3.connect(self.server.db)) as db:
-                    html = _dashboard(db, *login, self.server.sources)
-            except sqlite3.Error:
-                self._message(500, 'Local evidence store unavailable')
+            return
+        session = self._session(self._session_token())
+        if path == '/login':
+            if session is None:
+                self._send(200, _login_page())
             else:
-                self._send(200, _document('Inventory', html))
-        else:
+                self._send(303, Location='/')
+            return
+        if session is None:
+            self._send(303, Location='/login')
+            return
+        if path == '/patterns':
+            self._send(200, patterns())
+            return
+        username = session.username
+        try:
+            with closing(sqlite3.connect(self.server.db)) as db:
+                entries = _workspace_entries(db, username, self.server.users[username], self.server.sources)
+        except sqlite3.Error:
+            self._message(500, 'Local evidence store unavailable')
+            return
+        html = self.server.render_workspace(path, query, entries, username, session.csrf)
+        if html is None:
             self._message(404, 'Not found')
+        else:
+            self._send(200, html)
 
     def do_POST(self):
-        login = self._authenticate()
-        if login is None:
+        if not self._check_host():
             return
         if self._header('Origin') != self.server.origin:
             self._message(403, 'Origin rejected')
             return
-        if self.path not in ('/enable', '/disable', '/preview', '/collect'):
+        token = self._session_token()
+        if self.path == '/login':
+            self._login(token, self._read_form())
+            return
+        session = self._session(token)
+        if session is None:
+            self._message(401, 'Sign-in required')
+            return
+        if self.path not in ('/logout', '/enable', '/disable', '/preview', '/collect'):
             self._message(404, 'Not found')
             return
-        username, user = login
         form = self._read_form()
-        expected = {'csrf', 'source', 'preview'} if self.path == '/collect' else {'csrf', 'source'}
-        if form is None or form.keys() != expected:
+        fields = {'csrf'}
+        if self.path != '/logout':
+            fields.add('source')
+        if self.path == '/collect':
+            fields.add('preview')
+        if form is None or form.keys() != fields:
             self._message(400, 'Invalid form')
             return
-        if not _matches(user.csrf, form['csrf']):
+        if not _matches(session.csrf, form['csrf']):
             self._message(403, 'CSRF token rejected')
             return
+        if self.path == '/logout':
+            del self.server.sessions[token]
+            self._send(303, Location='/login', Set_Cookie=self._cookie('', 0))
+            return
+        user = self.server.users[session.username]
         source = self.server.sources.get(form['source'])
         if source is None or source.scope not in user.view:
             self._message(404, 'Not found')
             return
         try:
             with closing(sqlite3.connect(self.server.db)) as db:
-                self._action(db, username, user, source, form)
+                self._action(db, session, user, source, form)
         except sqlite3.Error:
             self._message(500, 'Local evidence store unavailable')
 
-    def _action(self, db, username, user, source, form):
-        previews = self.server.previews
+    def _action(self, db, session, user, source, form):
+        username = session.username
         if self.path in ('/enable', '/disable'):
             with db:
                 if self.path == '/enable':
                     db.execute('INSERT OR IGNORE INTO enabled VALUES (?, ?)', (username, source.key))
                 else:
                     db.execute('DELETE FROM enabled WHERE username=? AND source=?', (username, source.key))
-            previews.pop(username, None)
+            for active in self.server.sessions.values():
+                if active.username == username:
+                    active.preview = None
         else:
             if not _may_collect(source, user) or not _enabled(db, username, source):
                 self._message(403, 'Collection not permitted')
                 return
             if self.path == '/preview':
                 token = token_urlsafe(32)
-                previews[username] = (source.key, token, monotonic() + 300)
-                self._send(200, _document('Preview collection', _preview(source, user, token)))
+                session.preview = (source.key, token, monotonic() + _PREVIEW_SECONDS)
+                self._send(200, _document('Preview collection', _preview(source, session.csrf, token)))
                 return
-            pending = previews.get(username)
+            pending = session.preview
             if (pending is None or pending[0] != source.key or pending[2] <= monotonic()
                     or not _matches(pending[1], form['preview'])):
                 self._message(403, 'A fresh collection preview is required')
                 return
-            del previews[username]
+            session.preview = None
             _collect(db, source)
-        self._send(303, Location=f'/#{source.id}')
+        self._send(303, Location=f'/collectors?source={source.id}')
 
 
 class _InvalidPublicOrigin(ValueError):
@@ -646,6 +633,9 @@ def make_server(config_path, port=8765, *, public_origin=None):
     """Construct a loopback server; port 0 lets the OS choose, even behind a TLS proxy."""
     public_authority = None if public_origin is None else _public_authority(public_origin)
     users, sources, state_dir = _load_config(config_path)
+    # Offline commands do not need the workspace renderer.
+    from workspace_pages import render
+
     db = _open_store(state_dir)
     # Serve serially: a preview is consumed and its evidence committed once, before another action.
     server = HTTPServer((_LISTEN, port), _Handler)
@@ -656,8 +646,11 @@ def make_server(config_path, port=8765, *, public_origin=None):
     else:
         server.authority, server.origin = public_authority, public_origin
     server.users, server.sources, server.db = users, sources, db
-    server.unknown_user = _User(token_bytes(16), token_bytes(32), frozenset(), frozenset(), '')
-    server.previews = {}
+    server.secure_cookie = public_authority is not None
+    server.unknown_user = _User(token_bytes(16), token_bytes(32), frozenset(), frozenset())
+    server.sessions = {}
+    server.login_failures = {}
+    server.render_workspace = render
     return server
 
 

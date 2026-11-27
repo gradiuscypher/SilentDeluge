@@ -351,5 +351,47 @@ class LocalLinuxInventory(unittest.TestCase):
             ])
 
 
+class LinuxAddressesTest(unittest.TestCase):
+    def test_opted_in_addresses_are_local_canonical_and_fixed_field(self):
+        body = b'''[
+            {"ifname":"toy0","address":"synthetic-mac","addr_info":[
+                {"family":"inet6","local":"2001:0DB8:0:0::7","prefixlen":64,"peer":"synthetic-peer"},
+                {"family":"inet","local":"192.0.2.7","broadcast":"192.0.2.255","label":"synthetic-label"},
+                {"family":"inet6","local":"2001:db8::9","tentative":true},
+                {"family":"inet6","local":"2001:db8::a","dadfailed":true}]},
+            {"ifname":"toy1","addr_info":[{"family":"inet","local":"192.0.2.7"}]}
+        ]'''
+        with patch('source_linux.sys', platform='linux'), patch(
+            'source_linux.subprocess.run', return_value=SimpleNamespace(stdout=body),
+        ) as run:
+            result, = collect(dict(scope='toy-stage', packs=['addresses']))
+        self.assertEqual(run.call_args.args[0], ['ip', '-j', 'address', 'show'])
+        self.assertEqual(result, dict(section='addresses', outcome='complete', records=[
+            dict(asset='toy-stage', ip_address='192.0.2.7'),
+            dict(asset='toy-stage', ip_address='2001:db8::7'),
+        ]))
+
+    def test_default_does_not_read_addresses_and_unavailable_is_not_empty(self):
+        with patch('source_linux.sys', platform='linux'), patch(
+            'source_linux.subprocess.run', side_effect=PermissionError('synthetic denial'),
+        ) as run:
+            self.assertEqual(collect(dict(scope='toy-stage')), [])
+            run.assert_not_called()
+            self.assertEqual(collect(dict(scope='toy-stage', packs=['addresses'])), [
+                dict(section='addresses', outcome='failed', records=[]),
+            ])
+
+    def test_malformed_address_data_is_not_returned_as_a_complete_capture(self):
+        with patch('source_linux.sys', platform='linux'), patch(
+            'source_linux.subprocess.run', return_value=SimpleNamespace(stdout=b'''[
+                {"addr_info":[{"family":"inet","local":"192.0.2.7"},
+                              {"family":"inet","local":"2001:db8::2"}]}
+            ]'''),
+        ):
+            self.assertEqual(collect(dict(scope='toy-stage', packs=['addresses'])), [
+                dict(section='addresses', outcome='failed', records=[]),
+            ])
+
+
 if __name__ == '__main__':
     unittest.main()

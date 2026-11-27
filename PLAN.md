@@ -24,6 +24,18 @@ reason to remove an asset.
   including stopped guests, and compared it with approved declarations.
   Only name, kind, state, effective limits and provenance crossed the host
   boundary. No consumer admin identity, listener or recurring job was created.
+- The modular collector now supports Incus snapshots, Linux guest packs and
+  site-scoped UniFi device and client sightings. Linux packs have been exercised
+  on both a VM and a container. UniFi's synthetic qualification is not a live
+  acceptance: verifying the console's TLS identity is still a prerequisite.
+- The authenticated workspace separates machine, Incus and UniFi evidence.
+  Exact operator placements and time-bounded same-domain address candidates
+  are distinct claims; neither grants access. Collector onboarding and future
+  ACL/group/project controls are previews, not credential or policy editors.
+
+For source setup and the agent's first-collection checklist, use
+[COLLECTION.md](COLLECTION.md). Track delivery on the
+[GitHub Project](https://github.com/orgs/silentdeluge/projects/1), not here.
 
 ## Public repository boundary
 
