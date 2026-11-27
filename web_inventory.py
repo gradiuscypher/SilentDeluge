@@ -29,6 +29,7 @@ from web_design import page, patterns, styles
 _ID = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}')
 _VERIFIER = re.compile(r'pbkdf2-sha256\$600000\$([0-9a-f]{32})\$([0-9a-f]{64})')
 _TOKEN = re.compile(r'[a-zA-Z0-9_-]{43}')
+_DNS_LABEL = re.compile(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?')
 _ITERATIONS = 600_000
 _STATE_NAME = 'inventory.sqlite3'
 _LISTEN = '127.0.0.1'
@@ -529,15 +530,35 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(303, Location=f'/#{source.id}')
 
 
-def make_server(config_path, port=8765):
-    """Load private config and construct a loopback server; port 0 lets the OS choose."""
+class _InvalidPublicOrigin(ValueError):
+    pass
+
+
+def _public_authority(origin):
+    if isinstance(origin, str) and origin.startswith('https://'):
+        authority = origin.removeprefix('https://')
+        if 0 < len(authority) <= 253:
+            labels = authority.split('.')
+            # Browsers interpret numeric final labels as IPv4, including legacy hex forms.
+            if (not re.fullmatch(r'[0-9]+|0[xX][0-9A-Fa-f]*', labels[-1])
+                    and all(_DNS_LABEL.fullmatch(label) for label in labels)):
+                return authority
+    raise _InvalidPublicOrigin('--public-origin requires https://hostname with no port or other URL components')
+
+
+def make_server(config_path, port=8765, *, public_origin=None):
+    """Construct a loopback server; port 0 lets the OS choose, even behind a TLS proxy."""
+    public_authority = None if public_origin is None else _public_authority(public_origin)
     users, sources, state_dir = _load_config(config_path)
     db = _open_store(state_dir)
     # Serve serially: a preview is consumed and its evidence committed once, before another action.
     server = HTTPServer((_LISTEN, port), _Handler)
-    actual_port = server.server_port
-    server.authority = _LISTEN if actual_port == 80 else f'{_LISTEN}:{actual_port}'
-    server.origin = f'http://{server.authority}'
+    if public_authority is None:
+        actual_port = server.server_port
+        server.authority = _LISTEN if actual_port == 80 else f'{_LISTEN}:{actual_port}'
+        server.origin = f'http://{server.authority}'
+    else:
+        server.authority, server.origin = public_authority, public_origin
     server.users, server.sources, server.db = users, sources, db
     server.unknown_user = _User(token_bytes(16), token_bytes(32), frozenset(), frozenset(), '')
     server.previews = {}
@@ -551,6 +572,8 @@ def main():
     serve = commands.add_parser('serve', help='serve inventory on 127.0.0.1')
     serve.add_argument('--config', type=Path, required=True)
     serve.add_argument('--port', type=int, default=8765)
+    serve.add_argument('--public-origin', metavar='https://hostname',
+                       help='external HTTPS origin of a same-host TLS reverse proxy')
     args = parser.parse_args()
     if args.command == 'hash-password':
         try:
@@ -565,7 +588,9 @@ def main():
     if not 0 <= args.port <= 65535:
         parser.error('port must be between 0 and 65535')
     try:
-        server = make_server(args.config, args.port)
+        server = make_server(args.config, args.port, public_origin=args.public_origin)
+    except _InvalidPublicOrigin as exc:
+        serve.error(str(exc))
     except (OSError, ValueError, TypeError, RecursionError, sqlite3.Error):
         parser.exit(2, 'Could not load private web configuration/state or bind the loopback port.\n')
     with server:

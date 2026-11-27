@@ -54,10 +54,10 @@ class WebInventoryTests(unittest.TestCase):
             },
         }
 
-    def start(self):
+    def start(self, *, public_origin=None):
         self.path.write_text(json.dumps(self.config), encoding='utf-8')
         self.path.chmod(0o600)
-        self.server = self.enterContext(make_server(self.path, port=0))
+        self.server = self.enterContext(make_server(self.path, port=0, public_origin=public_origin))
         thread = Thread(target=self.server.serve_forever)
         thread.start()
         self.addCleanup(thread.join, 5)
@@ -70,13 +70,15 @@ class WebInventoryTests(unittest.TestCase):
                                         timestamp=f'2025-01-01T10:{minute:02d}:00Z',
                                         outcome=outcome, instances=instances)), encoding='utf-8')
 
-    def request(self, method, path, user='alice', fields=None, headers=None, password=None):
+    def request(self, method, path, user='alice', fields=None, headers=None, password=None, *, send_origin=True):
         request_headers = {}
         if user is not None:
             credentials = b64encode(f'{user}:{password or _PASSWORDS[user]}'.encode()).decode()
             request_headers['Authorization'] = f'Basic {credentials}'
         if fields is not None:
-            request_headers.update({'Content-Type': 'application/x-www-form-urlencoded', 'Origin': self.origin})
+            request_headers['Content-Type'] = 'application/x-www-form-urlencoded'
+            if send_origin:
+                request_headers['Origin'] = self.origin
         if headers:
             request_headers.update(headers)
         conn = HTTPConnection('127.0.0.1', self.server.server_port, timeout=5)
@@ -126,6 +128,47 @@ class WebInventoryTests(unittest.TestCase):
         status, headers, body = self.request('GET', '/style.css')
         self.assertEqual((status, headers.get_content_type()), (200, 'text/css'))
         self.assertIn('.status-badge', body)
+
+    def test_public_origin_requires_exact_host_and_post_origin(self):
+        authority = 'inventory.example.test'
+        origin = f'https://{authority}'
+        self.start(public_origin=origin)
+        self.assertEqual(self.server.server_address[0], '127.0.0.1')
+
+        spoofed = {'Forwarded': f'host={authority};proto=https',
+                   'X-Forwarded-Host': authority, 'X-Forwarded-Proto': 'https',
+                   'X-Forwarded-Port': '443', 'X-Forwarded-Origin': origin}
+        for host in (self.origin.removeprefix('http://'), authority.upper(), f'{authority}:443'):
+            with self.subTest(host=host):
+                self.assertEqual(self.request('GET', '/', headers={**spoofed, 'Host': host})[0], 400)
+
+        host_header = {'Host': authority}
+        status, _, html = self.request('GET', '/', headers=host_header)
+        self.assertEqual(status, 200)
+        form = dict(csrf=self.field(html, 'csrf'), source='stagelight')
+        for wrong_origin in (None, 'null', self.origin, f'http://{authority}',
+                             f'https://{authority.upper()}', f'{origin}:443', f'{origin}/'):
+            with self.subTest(origin=wrong_origin):
+                headers = {**spoofed, **host_header}
+                if wrong_origin is not None:
+                    headers['Origin'] = wrong_origin
+                self.assertEqual(self.request('POST', '/enable', fields=form, headers=headers,
+                                              send_origin=False)[0], 403)
+
+        headers = {**host_header, 'Origin': origin, 'Forwarded': 'host=other.test;proto=http',
+                   'X-Forwarded-Host': 'other.test', 'X-Forwarded-Proto': 'http'}
+        self.assertEqual(self.request('POST', '/enable', fields=form, headers=headers)[0], 303)
+
+    def test_public_origin_rejects_non_dns_or_non_bare_https_urls(self):
+        for origin in ('', 'http://inventory.example.test', 'https://user@inventory.example.test',
+                       'https://inventory.example.test/', 'https://inventory.example.test?',
+                       'https://inventory.example.test#', 'https://inventory.example.test:443',
+                       'https://127.0.0.1', 'https://[::1]', 'https://0x7f000001',
+                       'https://under_score.test', 'https://-invalid.test', 'https://invalid..test',
+                       'https://inventory.example.test.', 'https://inventory.example.test\n',
+                       'https://' + 'a' * 64 + '.test'):
+            with self.subTest(origin=origin), self.assertRaisesRegex(ValueError, '--public-origin'):
+                self.start(public_origin=origin)
 
     def test_scope_filtering_personal_enablement_and_view_only_grant(self):
         self.capture('stagelight', 'complete', 0, _instance('stage-secret'))
