@@ -109,7 +109,7 @@ button:hover { background: var(--paper); }
 form input[type="search"] { inline-size: min(100%, 28ch); }
 
 :focus-visible,
-[tabindex="-1"]:focus {
+[tabindex="-1"]:not(main):focus {
   outline: 2px solid var(--focus);
   outline-offset: 3px;
 }
@@ -308,7 +308,7 @@ form input[type="search"] { inline-size: min(100%, 28ch); }
   }
 }
 
-#main-content:focus { outline-offset: -3px; }
+#main-content:focus-visible { outline-offset: -3px; }
 
 .stack {
   display: grid;
