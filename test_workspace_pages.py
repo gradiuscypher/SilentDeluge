@@ -52,39 +52,37 @@ class _Page(HTMLParser):
         self.headings = []
         self.rows = []
         self.row_headers = []
-        self.row_details = []
+        self.row_links = []
+        self.cell_tags = set()
         self._section = None
         self._cell = None
-        self._details = False
+        self._scope = None
         self.feed(markup)
 
     def handle_starttag(self, tag, attrs):
         if tag == 'a' and (url := dict(attrs).get('href')) is not None:
             self.links.append(url)
+            if self._section == 'tbody' and self._scope == 'row':
+                self.row_links[-1].append(url)
+        if self._section == 'tbody' and self._cell is not None:
+            self.cell_tags.add(tag)
         if tag in ('caption', 'thead', 'tbody'):
             self._section = tag
         if tag == 'tr' and self._section == 'tbody':
             self.rows.append([])
             self.row_headers.append([])
-            self.row_details.append([])
+            self.row_links.append([])
         if tag in ('th', 'td') and self._section in ('thead', 'tbody'):
             self._cell = []
             self._scope = dict(attrs).get('scope')
-        if tag == 'details':
-            self._details = True
 
     def handle_data(self, data):
         if self._section == 'caption':
             self.caption += data
         elif self._cell is not None and data.strip():
-            if self._details:
-                self.row_details[-1].append(data.strip())
-            else:
-                self._cell.append(data.strip())
+            self._cell.append(data.strip())
 
     def handle_endtag(self, tag):
-        if tag == 'details':
-            self._details = False
         if tag in ('th', 'td') and self._cell is not None:
             text = ' '.join(self._cell)
             if self._section == 'thead':
@@ -93,15 +91,21 @@ class _Page(HTMLParser):
                 self.rows[-1].append(text)
                 self.row_headers[-1].append((tag, self._scope))
             self._cell = None
+            self._scope = None
         if tag == self._section:
             self._section = None
 
     def by_title(self):
-        return {name: cells + details for (name, *cells), details in zip(self.rows, self.row_details)}
+        return {name: cells for name, *cells in self.rows}
 
 
 def _render(path, entries, **query):
     return render(path, query, entries, 'reader <test>', 'csrf"token')
+
+
+def _follow(url, entries):
+    target = urlsplit(url)
+    return _render(target.path, entries, **dict(parse_qsl(target.query)))
 
 
 class WorkspacePagesTests(unittest.TestCase):
@@ -109,6 +113,7 @@ class WorkspacePagesTests(unittest.TestCase):
         self.assertEqual(parsed.caption, caption)
         self.assertEqual(parsed.headings, [('th', 'col', name) for name in columns])
         self.assertEqual(parsed.row_headers, [[('th', 'row')] + [('td', None)] * (len(columns) - 1)] * len(parsed.rows))
+        self.assertFalse({'details', 'dl', 'ul', 'ol', 'pre'} & parsed.cell_tags)
 
     def test_incus_defaults_to_instances_from_all_enabled_sources(self):
         main = _entry('stage', 'incus', scope=_PROJECT, state=_state(
@@ -125,13 +130,19 @@ class WorkspacePagesTests(unittest.TestCase):
         markup = _render('/incus', entries)
         parsed = _Page(markup)
         self.assert_table(parsed, 'Incus instances', 'Instance', 'Kind', 'State', 'CPU limit (count or pin set)',
-                          'Memory limit (as reported)', 'Location', 'Evidence', 'Source and scope', 'Capture time',
-                          'Details')
+                          'Memory limit (as reported)', 'Location', 'Evidence', 'Source and scope', 'Capture time')
         self.assertEqual([row[0] for row in parsed.rows], ['paper-moon', 'tin-piano', 'velvet-curtain'])
         self.assertEqual(parsed.rows[0], ['paper-moon', 'container', 'Running', '2', '1GiB', 'node-a', 'Complete',
-                                          f'stage {_PROJECT}', _CAPTURED, ''])
-        self.assertIn('Details for paper-moon', parsed.row_details[0])
-        self.assertIn('profile-not-in-cell', parsed.row_details[0])
+                                          f'stage {_PROJECT}', _CAPTURED])
+        self.assertNotIn('profile-not-in-cell', markup)
+        link, = parsed.row_links[0]
+        self.assertEqual(urlsplit(link).path, '/incus/detail')
+        detail = _follow(link, entries)
+        self.assertIn('profile-not-in-cell', detail)
+        self.assertIn('Scope: theatre/stage', detail)
+        self.assertIn('Complete capture', detail)
+        self.assertNotIn('tin-piano', detail)
+        self.assertFalse(_Page(detail).rows)
         self.assertEqual(markup.count('Latest section outcome:'), 2)
         for excluded in ('runtime-only', 'hidden-source', 'hidden-scope', 'hidden-instance', 'stage &lt;plan&gt;'):
             self.assertNotIn(excluded, markup)
@@ -149,7 +160,7 @@ class WorkspacePagesTests(unittest.TestCase):
         entries = [_entry('waiting', 'linux'), _entry('host', 'linux', scope='stage/floor', state=state)]
         landing = _Page(_render('/machines', entries))
         self.assert_table(landing, 'Machine overview', 'Machine', 'Scope', 'OS', 'Kernel', 'CPU usage', 'Memory used',
-                          'Evidence', 'Latest attempt', 'Drilldown')
+                          'Evidence', 'Latest attempt')
         self.assertEqual([row[0] for row in landing.rows], ['host', 'waiting'])
         self.assertEqual(landing.rows[0][:6], ['host', 'stage/floor', 'debian 12', '6.1.0', '0% Stale',
                                                '64 MiB / uncapped'])
@@ -158,12 +169,20 @@ class WorkspacePagesTests(unittest.TestCase):
         filtered = _Page(_render('/machines', entries, q='DEBIAN 6.1.0', status='stale'))
         self.assertEqual(filtered.rows, [landing.rows[0]])
         link = '/machines?source=host&section=system'
-        self.assertIn(link, landing.links)
-        target = urlsplit(link)
-        drilldown = _Page(_render(target.path, entries, **dict(parse_qsl(target.query))))
+        host, = landing.row_links[0]
+        machine = _follow(host, entries)
+        self.assertIn(link, _Page(machine).links)
+        self.assertIn('Scope: stage/floor', machine)
+        self.assertIn('/machines?source=host&section=packages', _Page(machine).links)
+        waiting, = landing.row_links[1]
+        self.assertIn('No inventory sections received', _follow(waiting, entries))
+        drilldown = _Page(_follow(link, entries))
         self.assert_table(drilldown, 'System', 'Observation', 'OS', 'OS version', 'Kernel', 'Architecture', 'Evidence',
-                          'Source and scope', 'Capture time', 'Details')
+                          'Source and scope', 'Capture time')
         self.assertEqual(drilldown.rows[0][:5], ['floor host', 'debian', '12', '6.1.0', 'x86_64'])
+        sample, = drilldown.row_links[0]
+        self.assertIn(sample, landing.links)
+        self.assertIn('<dt>Architecture</dt><dd>x86_64</dd>', _follow(sample, entries))
 
     def test_empty_instances_distinguish_no_enabled_source_no_capture_and_complete_empty(self):
         disabled = _entry('private-stage', 'incus', scope='private-scope', enabled=False)
@@ -194,9 +213,11 @@ class WorkspacePagesTests(unittest.TestCase):
         self.assertIn('name="csrf" value="csrf&quot;token"', markup)
         self.assertTrue({'/machines', '/incus', '/unifi', '/relationships', '/collectors', '/access', '/patterns'}
                         <= set(_Page(markup).links))
-        landing = _render('/machines', [machine, disabled])
-        self.assertIn('/machines?source=guest&section=packages', _Page(landing).links)
-        self.assertNotIn('private-package', landing)
+        landing = _Page(_render('/machines', [machine, disabled]))
+        guest, = landing.row_links[0]
+        detail = _follow(guest, [machine, disabled])
+        self.assertIn('/machines?source=guest&section=packages', _Page(detail).links)
+        self.assertNotIn('private-package', detail)
 
     def test_get_search_filters_source_section_and_evidence_status(self):
         alpha = _entry('alpha', 'linux', state=_state(
@@ -209,21 +230,24 @@ class WorkspacePagesTests(unittest.TestCase):
                          section='packages', status='complete')
         parsed = _Page(markup)
         self.assert_table(parsed, 'Installed packages', 'Package', 'Version', 'Architecture', 'Manager',
-                          'Evidence', 'Source and scope', 'Capture time', 'Details')
-        self.assertEqual(parsed.rows, [['aLPha-package', '4.2', '—', '—', 'Complete', 'alpha alpha', _CAPTURED, '']])
-        self.assertIn('<shade>', parsed.row_details[0])
+                          'Evidence', 'Source and scope', 'Capture time')
+        self.assertEqual(parsed.rows, [['aLPha-package', '4.2', '—', '—', 'Complete', 'alpha alpha', _CAPTURED]])
+        link, = parsed.row_links[0]
+        detail = _follow(link, [alpha, beta])
         self.assertNotIn('other-package', markup)
         self.assertIn('Showing 1–1 of 1 results', markup)
         self.assertIn('<form method="get" action="/machines"', markup)
         self.assertIn('<a href="/machines">Clear filters</a>', markup)
-        self.assertIn('&lt;shade&gt;', markup)
-        self.assertNotIn('<shade>', markup)
+        self.assertNotIn('&lt;shade&gt;', markup)
+        self.assertIn('<dt>Description</dt><dd>&lt;shade&gt;</dd>', detail)
+        self.assertNotIn('<shade>', detail)
+        self.assertNotIn('other-package', detail)
         search = _render('/machines', [alpha, beta], q='4.2', section='services', status='masked')
         self.assertEqual(_Page(search).rows[0][:3], ['alpha-service', 'masked', '—'])
         empty = _render('/machines', [alpha, beta], section='services', status='partial')
         self.assertEqual(_Page(empty).rows, [])
         self.assertIn('0 results', empty)
-        self.assertIn('no matches do not establish absence', empty)
+        self.assertIn('does not establish absence', empty)
 
     def test_pagination_bounds_the_response_and_carries_filters_forward(self):
         packages = _capture(*(dict(name=f'pkg-{i:03}', note=f'evidence-marker-{i:03}') for i in reversed(range(61))))
@@ -258,37 +282,36 @@ class WorkspacePagesTests(unittest.TestCase):
         site = _entry('site', 'unifi', state=_state(managed_devices=devices, connected_clients=_capture(client)))
         landing = _Page(_render('/unifi', [site]))
         self.assert_table(landing, 'Managed devices', 'Device', 'Model', 'State', 'IP address', 'Firmware',
-                          'Evidence', 'Source and scope', 'Capture time', 'Details')
+                          'Evidence', 'Source and scope', 'Capture time')
         self.assertEqual([row[0] for row in landing.rows], ['other-stage', 'side-stage'])
         markup = _render('/unifi', [site], status='online', q='Ethernet')
         parsed = _Page(markup)
         self.assertEqual(parsed.rows, [landing.rows[1]])
         self.assertEqual(parsed.rows[0][:6], ['side-stage', 'USW-24', 'ONLINE', '192.0.2.1', '7.1', 'Complete'])
-        detail_values = parsed.row_details[0]
-        self.assertIn('Details for side-stage', detail_values)
-        self.assertIn('Power over Ethernet', detail_values)
-        self.assertIn('No', detail_values)
-        self.assertIn('0', detail_values)
-        self.assertIn('Not reported', detail_values)
-        self.assertNotIn('other-stage', markup)
-        self.assertNotIn('client-only', markup)
-        self.assertNotIn('&quot;speed_mbps&quot;', markup)
-        self.assertIn(f'datetime="{_SIGHTED}"', markup)
-        detail, = [urlsplit(link) for link in _Page(markup).links if 'item=' in link]
-        self.assertEqual(dict(parse_qsl(detail.query)), dict(source='site', section='managed_devices', item='device:one'))
-        self.assertEqual(list(_Page(_render(detail.path, [site], **dict(parse_qsl(detail.query)))).by_title()),
-                         ['side-stage'])
+        link, = parsed.row_links[0]
+        self.assertEqual(urlsplit(link).path, '/unifi/detail')
+        detail = _follow(link, [site])
+        for value in ('<dt>Power over Ethernet</dt>', '<dt>Enabled</dt><dd>No</dd>',
+                      '<dt>Speed mbps</dt><dd>0</dd>', '<dt>Note</dt><dd>Not reported</dd>',
+                      f'datetime="{_SIGHTED}"'):
+            self.assertIn(value, detail)
+        for excluded in ('other-stage', 'client-only', 'Power over Ethernet', _SIGHTED):
+            self.assertNotIn(excluded, markup)
+        self.assertNotIn('other-stage', detail)
+        self.assertIn('/unifi?source=site&section=managed_devices', _Page(detail).links)
         client_url = '/unifi?section=connected_clients'
         self.assertIn(client_url, landing.links)
         target = urlsplit(client_url)
         clients = _render(target.path, [site], **dict(parse_qsl(target.query)))
         parsed_clients = _Page(clients)
         self.assert_table(parsed_clients, 'Connected clients', 'Client', 'Type', 'IP address', 'MAC address',
-                          'Connected at', 'Evidence', 'Source and scope', 'Capture time', 'Details')
+                          'Connected at', 'Evidence', 'Source and scope', 'Capture time')
         self.assertEqual(parsed_clients.rows[0][:5], ['client-only', 'WIRED', '192.0.2.2', '02:00:00:00:00:01',
                                                      _SIGHTED])
         self.assertEqual(_Page(_render('/unifi', [site], source='site', q=client['id'])).rows, parsed_clients.rows)
         self.assertIn('absence is not established', clients)
+        client_link, = parsed_clients.row_links[0]
+        self.assertIn(client['id'], _follow(client_link, [site]))
 
     def test_placement_and_relationship_links_require_authorized_enabled_targets(self):
         guest = _entry('guest', 'linux', scope='theatre/paper-moon',
@@ -311,10 +334,13 @@ class WorkspacePagesTests(unittest.TestCase):
         links = _Page(_render('/machines', entries, source='guest')).links
         target = '/incus?source=approved&section=instances&item=paper-moon'
         self.assertIn(target, links)
-        detail = _render('/incus', entries, **dict(parse_qsl(urlsplit(target).query)))
-        self.assertEqual(list(_Page(detail).by_title()), ['paper-moon'])
-        self.assertIn('/machines?source=guest', _Page(detail).links)
-        self.assertNotIn('/machines?source=same-name', _Page(detail).links)
+        listing = _Page(_follow(target, entries))
+        self.assertEqual(list(listing.by_title()), ['paper-moon'])
+        self.assertIn('/machines?source=guest', listing.links)
+        record, = listing.row_links[0]
+        detail_links = _Page(_follow(record, entries)).links
+        self.assertIn('/machines?source=guest', detail_links)
+        self.assertNotIn('/machines?source=same-name', detail_links)
         relationships = _render('/relationships', entries, source='approved')
         self.assertIn('<!doctype html>', relationships)
         self.assertIn('Candidate IP overlaps', relationships)
@@ -338,8 +364,18 @@ class WorkspacePagesTests(unittest.TestCase):
         self.assertIn(f'datetime="{_DECLARED}"', markup)
         self.assertIn(f'datetime="{_CAPTURED}"', markup)
         self.assertNotIn('aarch64', markup)
+        observed = _Page(_render('/incus', [project], section='instances', item='paper-moon'))
+        observed_link, = observed.row_links[0]
+        self.assertIn('aarch64', _follow(observed_link, [project]))
+        compared = _Page(_render('/incus', [project], section='comparison', item='velvet-curtain'))
+        compared_link, = compared.row_links[0]
+        detail = _follow(compared_link, [project])
+        self.assertIn('<dt>Declared</dt>', detail)
+        self.assertIn('<dt>Observed</dt>', detail)
+        self.assertIn('stage &lt;plan&gt;', detail)
+        self.assertIn(f'datetime="{_DECLARED}"', detail)
+        self.assertNotIn('aarch64', detail)
         observed = _render('/incus', [project], section='instances')
-        self.assertIn('aarch64', observed)
         self.assertNotIn('tin-piano', observed)
         self.assertEqual(list(_Page(_render('/incus', [project], section='comparison', q='TIN', status='absent'))
                               .by_title()), ['tin-piano'])
@@ -383,6 +419,106 @@ class WorkspacePagesTests(unittest.TestCase):
         disconnected = dict(project, state=None)
         self.assertIn('Not connected', _Page(_render('/incus', [disconnected], section='comparison'))
                       .by_title()['paper-moon'])
+
+    def test_duplicate_identities_select_the_exact_capture_and_do_not_rebind(self):
+        original = dict(name='mirror', id='duplicate-id', note='retained-complete-note')
+        partial = dict(original, note='newer-partial-note')
+        state = _state(managed_devices=_capture(original, original))
+        state['sections']['managed_devices']['partial'] = _capture(partial, timestamp=_SIGHTED)
+        state['results']['managed_devices'] = dict(outcome='partial', timestamp=_SIGHTED)
+        site = _entry('site', 'unifi', scope='site/synthetic', state=state)
+        grid = _Page(_render('/unifi', [site]))
+        self.assertEqual([row[0] for row in grid.rows], ['mirror'] * 3)
+        (first,), (duplicate,), (sighting,) = grid.row_links
+        self.assertEqual(len({first, duplicate, sighting}), 3)
+        for link in (first, duplicate):
+            detail = _follow(link, [site])
+            self.assertIn('retained-complete-note', detail)
+            self.assertIn('Last verified complete capture', detail)
+            self.assertNotIn('newer-partial-note', detail)
+        detail = _follow(sighting, [site])
+        self.assertIn('newer-partial-note', detail)
+        self.assertIn('Partial sighting', detail)
+        self.assertNotIn('retained-complete-note', detail)
+
+        replaced = dict(site, state=_state(managed_devices=_capture(original, timestamp=_ATTEMPTED)))
+        rebound = dict(site, scope='site/rebound')
+        for unavailable in ([], [dict(site, enabled=False)], [replaced], [rebound]):
+            with self.subTest(unavailable=unavailable):
+                self.assertIsNone(_follow(first, unavailable))
+                self.assertIsNone(_follow(sighting, unavailable))
+        target = urlsplit(first)
+        query = dict(parse_qsl(target.query))
+        self.assertIsNone(_render('/machines/detail', [site], **query))
+        self.assertIsNone(_render(target.path, [site], item=query['item']))
+        self.assertIsNone(_render(target.path, [site], source='site', item='duplicate-id'))
+        mirror = dict(site, id='other-site')
+        self.assertIsNone(_render(target.path, [site, mirror], **dict(query, source='other-site')))
+
+    def test_comparison_link_reassesses_absence_when_the_capture_is_retained(self):
+        state = _state(instances=_capture(_instance('paper-moon')))
+        project = _entry('stage', 'incus', scope=_PROJECT, state=state, declarations=_declarations())
+        grid = _Page(_render('/incus', [project], section='comparison', item='tin-piano'))
+        link, = grid.row_links[0]
+        self.assertIn('>Absent</span>', _follow(link, [project]))
+        failed = dict(state, results={'instances': dict(outcome='failed', timestamp=_ATTEMPTED)})
+        retained = _follow(link, [dict(project, state=failed)])
+        self.assertIn('>Unknown</span>', retained)
+        self.assertIn('Latest section outcome: failed', retained)
+        self.assertIn('did not verify current presence or absence', retained)
+        self.assertNotIn('>Absent</span>', retained)
+
+    def test_extension_and_long_structured_data_are_linked_without_unbounded_query_values(self):
+        section = 'synthetic-extension-' + 'é' * 260
+        long_name = 'synthetic-device-' + '界' * 320
+        long_value = 'version-' + 'x' * 320
+        record = dict(name=long_name, model={'ports': [dict(label='nested <port>')]},
+                      firmware_version=long_value)
+        site = _entry('site', 'unifi', state=_state(managed_devices=_capture(record),
+                                                  **{section: _capture(dict(note='extension-only'))}))
+        listing = _render('/unifi', [site])
+        parsed = _Page(listing)
+        self.assertIn('1 field', parsed.rows[0])
+        self.assertTrue(parsed.rows[0][0].endswith('…'))
+        self.assertNotIn(long_name, listing)
+        self.assertNotIn(long_value, listing)
+        self.assertNotIn('nested &lt;port&gt;', listing)
+        detail_link, = parsed.row_links[0]
+        self.assertLessEqual(len(dict(parse_qsl(urlsplit(detail_link).query))['item']), 256)
+        detail = _follow(detail_link, [site])
+        for value in (long_name, long_value, 'nested &lt;port&gt;'):
+            self.assertIn(value, detail)
+        extension, = [url for url in parsed.links if dict(parse_qsl(urlsplit(url).query)).get(
+            'section', '').startswith('@')]
+        extension_grid = _Page(_follow(extension, [site]))
+        self.assertEqual(extension_grid.rows[0][0], 'Observation')
+        link, = extension_grid.row_links[0]
+        extension_detail = _follow(link, [site])
+        self.assertIn('extension-only', extension_detail)
+        self.assertIn(extension.replace('?section=', '?source=site&section='), _Page(extension_detail).links)
+
+    def test_each_collected_section_links_to_only_one_full_record(self):
+        sections_by_provider = (
+            ('/machines', 'linux', ('system', 'packages', 'services', 'cpu', 'addresses', 'memory', 'disk',
+                                    'storage', 'users', 'interfaces', 'network_links')),
+            ('/incus', 'incus', ('instances', 'runtime', 'guest_addresses')),
+            ('/unifi', 'unifi', ('managed_devices', 'connected_clients')),
+        )
+        for path, provider, sections in sections_by_provider:
+            for section in sections:
+                with self.subTest(provider=provider, section=section):
+                    records = _capture(_instance('first-record', note='record-one-evidence'),
+                                       _instance('second-record', note='record-two-evidence'))
+                    entry = _entry('fixture', provider, state=_state(**{section: records}))
+                    markup = _render(path, [entry], section=section)
+                    parsed = _Page(markup)
+                    self.assertEqual([row[0] for row in parsed.rows], ['first-record', 'second-record'])
+                    self.assertNotIn('record-one-evidence', markup)
+                    first, = parsed.row_links[0]
+                    detail = _follow(first, [entry])
+                    self.assertIn('record-one-evidence', detail)
+                    self.assertNotIn('record-two-evidence', detail)
+                    self.assertIn(f'{path}?source=fixture&section={section}', _Page(detail).links)
 
     def test_settings_routes_keep_collector_controls_and_pass_query_to_provider_guide(self):
         entries = [_entry('approved', 'linux'), _entry('paused', 'incus', enabled=False)]

@@ -57,7 +57,7 @@ python3 web_inventory.py serve --config "$private/web.json" --port 8765
 
 ## Sign in and use the workspaces
 
-Open the printed URL and submit a configured username and password at `/login`. To switch accounts, choose **Log out**, then sign in as the other user. Logging out revokes that browser session immediately without changing evidence or view preferences. Sessions expire after eight hours, are cleared by a server restart, and are limited to eight per account (the oldest is revoked first). The browser cookie is host-only, `HttpOnly`, and `SameSite=Strict`; it also has `Secure` in HTTPS mode.
+Open the printed URL and submit a configured username and password at `/login`. Signed-in pages share a workspace sidebar and account controls. To switch accounts, choose **Log out**, then sign in as the other user. Logging out revokes that browser session immediately without changing evidence or view preferences. Sessions expire after eight hours, are cleared by a server restart, and are limited to eight per account (the oldest is revoked first). The browser cookie is host-only, `HttpOnly`, and `SameSite=Strict`; it also has `Secure` in HTTPS mode.
 
 Five failed sign-ins in 30 seconds trigger `429` with `Retry-After` until that window ends. Blocked retries do not extend the window, revoke active sessions, or block other accounts. A sustained stream of failures can still delay new sign-ins for the targeted account.
 
@@ -73,7 +73,7 @@ Five failed sign-ins in 30 seconds trigger `429` with `Retry-After` until that w
 | `/access` | Your effective scope grants |
 | `/patterns` | Synthetic design examples |
 
-Follow workspace links for available source details and section filters. Search and detail parameters cannot expand your scope grants. Anonymous page requests redirect to `/login`; the inventory no longer accepts HTTP Basic credentials.
+Use the sidebar to switch workspaces. Follow inventory links to open evidence details within your enabled sources. Detail links identify an exact source and an opaque item; a record link can stop working when its retained capture is replaced. Search, filters, and detail links cannot expand your scope grants. Anonymous page requests redirect to `/login`; the inventory does not accept HTTP Basic credentials.
 
 ## Serve behind a same-host TLS reverse proxy
 
@@ -144,7 +144,7 @@ python3 web_inventory.py import-evidence --config "$private/web.json" \
 Automated CLI and HTTP scenarios use only temporary files, loopback, synthetic Incus and Linux envelopes, and the saved synthetic runtime example:
 
 ```sh
-python3 -m unittest -v test_web_inventory
+python3 -m unittest -v test_settings_pages test_web_inventory
 ```
 
 Browser acceptance at `http://127.0.0.1:8765`:

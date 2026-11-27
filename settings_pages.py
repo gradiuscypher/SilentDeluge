@@ -3,19 +3,7 @@
 from html import escape
 from urllib.parse import urlencode
 
-from web_design import page
 
-
-_NAV = (
-    ('/', 'Overview'),
-    ('/machines', 'Machines'),
-    ('/incus', 'Incus'),
-    ('/unifi', 'UniFi'),
-    ('/relationships', 'Relationships'),
-    ('/collectors', 'Collectors'),
-    ('/access', 'Access'),
-    ('/patterns', 'Design patterns'),
-)
 _TITLES = {
     '/collectors': 'Collectors',
     '/collectors/new': 'New collector',
@@ -66,10 +54,9 @@ def _link(path, label, *, current=False):
     return f'<a href="{escape(path)}"{marker}>{escape(label)}</a>'
 
 
-def _post_form(action, csrf, label, *, source=None):
-    fields = f'<input type="hidden" name="csrf" value="{escape(csrf)}">'
-    if source is not None:
-        fields += f'<input type="hidden" name="source" value="{escape(source)}">'
+def _post_form(action, csrf, label, *, source):
+    fields = (f'<input type="hidden" name="csrf" value="{escape(csrf)}">'
+              f'<input type="hidden" name="source" value="{escape(source)}">')
     return (f'<form action="{action}" method="post">{fields}'
             f'<button type="submit">{label}</button></form>')
 
@@ -112,13 +99,10 @@ def _collectors(entries, csrf):
     cards = ''.join(_collector_card(entry, csrf) for entry in entries)
     sources = f'<div class="panel-grid">{cards}</div>' if cards else '<p>No collectors are available in your scopes.</p>'
     return f'''
-    <p class="lede">Manage which approved sources show evidence for your account.</p>
     <nav class="section-nav" aria-label="Collector settings">
       <a href="/collectors/new">New collector</a>
-      <a href="/access">Review your access</a>
     </nav>
-    <p>Enabling a view changes only what you see. Previewing one collection requires a grant and an enabled
-      evidence view; it does not collect until you confirm.</p>
+    <p>Enabling evidence does not collect it. Manual collection requires a grant, an enabled view, and confirmation.</p>
     {sources}'''
 
 
@@ -144,8 +128,7 @@ def _new_collector(query):
     </section>'''
     return f'''
     <p><a href="/collectors">Back to collectors</a></p>
-    <p class="lede">Review a configuration example before requesting approval. This guide accepts no
-      secrets and does not install, run, configure, or grant access to a collector.</p>
+    <p>Examples only. Do not enter credentials here; this page does not configure collectors or grant access.</p>
     <section class="panel" aria-labelledby="provider-heading">
       <h2 id="provider-heading">1. Choose a provider</h2>
       <nav class="section-nav" aria-label="Provider templates">{options}</nav>
@@ -177,7 +160,6 @@ def _scope_panels(entries):
 
 def _access(entries):
     return f'''
-    <p class="lede">Review the permissions that apply to your account and configured collectors.</p>
     <section class="stack" aria-labelledby="effective-access">
       <h2 id="effective-access">Effective access now</h2>
       <p>The server uses exact scope grants, not project membership or named roles. A view grant lets you
@@ -202,8 +184,7 @@ def _access(entries):
           that collector and operation. Excluding view would also prevent preview and collect.</dd>
       </dl>
       <p>No project, group, role or ACL changes are available here.</p>
-    </section>
-    <p><a href="/collectors">Back to collectors</a></p>'''
+    </section>'''
 
 
 def render(path: str, query: dict[str, str], entries: list[dict], username: str, csrf: str) -> str | None:
@@ -216,16 +197,6 @@ def render(path: str, query: dict[str, str], entries: list[dict], username: str,
         content = _access(entries)
     else:
         return None
-    title = _TITLES[path]
-    nav = ''.join(_link(url, label, current=url == path) for url, label in _NAV)
-    logout = _post_form('/logout', csrf, 'Log out')
-    return page(title, f'''
-    <div class="patterns stack">
-      <header class="report-header stack">
-        <nav class="section-nav" aria-label="Workspace">{nav}</nav>
-        <div class="section-nav"><p>Signed in as <strong>{escape(username)}</strong>.</p>{logout}</div>
-        <p class="eyebrow">Workspace / Settings</p>
-        <h1>{title}</h1>
-      </header>
-      {content}
-    </div>''')
+    from web_design import dashboard_page
+
+    return dashboard_page(path, _TITLES[path], content, username, csrf)
