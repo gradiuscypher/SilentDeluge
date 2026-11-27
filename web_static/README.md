@@ -4,8 +4,9 @@
 signed-in document. Pass the current route, a plain-text title, trusted HTML
 without an `<h1>`, and the session's username and CSRF token. The shell supplies
 the only `<h1>`, the workspace navigation, POST logout, and a focusable main
-landmark. Reserve `main-content` as the skip target. Use `<h2>` to start body
-sections. Do not supply a second workspace menu or logout form in the body.
+landmark. Reserve `main-content` for the skip target and `dashboard-workspace`
+for the panel controlled by Menu. Use `<h2>` to start body sections. Do not supply a
+second workspace menu or logout form in the body.
 
 `web_design.page(title, body_html)` is the separate sign-in and message shell.
 For that shell, include one `<h1>` in the trusted body. Escape every untrusted
@@ -32,7 +33,7 @@ See [DESIGN.md](../DESIGN.md) for the Primer and Carbon references.
 | Sections | `.stack` spaces children vertically. `.section-heading` groups a section heading with a short explanatory paragraph. |
 | Collection cards | `.panel-grid` lays out `.panel` children and collapses to one column as needed. Add `.panel--wide` to a child that should span the grid. |
 | Local navigation | Use a named `<nav class="section-nav">` for subviews or in-page jumps, not primary workspace links. Use `aria-current="page"` on the current subview. |
-| Filter bar | Place a labeled GET `<form class="toolbar filters">` before the results. Either wrap a field in its label or group an explicit label and field in `.filter-field`. Labels and controls share a compact desktop row; field groups can wrap on mobile. Retain query values and offer a reset link when filters are active. |
+| Filter bar | Place a labeled GET `<form class="toolbar filters">` before the results. Either wrap a field in its label or group an explicit label and field in `.filter-field`. Keep search first. Labels and controls share a compact desktop row; below 60rem the form becomes a single horizontal control rail with a scroll cue. Retain query values and offer a reset link when filters are active. |
 | Result summary | Put `.summary` text before the results: the visible range and total, or an explicit empty message and a way to reset. |
 | Evidence table | Use a native `<table class="data-table">` with caption and scoped column and row headers. For a genuinely wide table, wrap it in `<div class="table-scroll" role="region" tabindex="0" aria-labelledby="…">` named by its caption. |
 | Table preview | Use `<span class="table-preview">` for non-interactive summary text (at most two visible lines). Use the row name as a link or add a `.detail-link` outside the clamp with a record-specific accessible name. Render full values and detail-only fields in the destination, not in CSS-hidden table cells. |
@@ -48,9 +49,10 @@ keeps the prior observation time. Put the reason and scope in adjacent text.
 
 The system light and dark themes use neutral ruled surfaces, a blue action
 color, clear focus outlines, and local system typography. The data track
-fills the available width up to about 1,800 CSS pixels. The same icon-and-text
-sidebar reflows above the data, without relying on a disclosure or hiding
-links. Keep state labels visible independently of badge color.
+fills the available width up to about 1,800 CSS pixels. Below 60rem a closed
+native Menu disclosure controls that same sidebar's links and account actions.
+Desktop and mobile share one navigation landmark and one logout form. Keep
+state labels visible independently of badge color.
 
 Use native focusable elements for controls. In-page jump links can focus their
 heading targets with `tabindex="-1"`.
@@ -66,8 +68,12 @@ heading targets with `tabindex="-1"`.
    to main. Follow a Full evidence link and verify that focus lands on the
    matching record heading. Toggle provenance with Enter or Space. Follow
    Next page, then Previous page; focus and shown range should change.
-4. In both themes, at desktop and 320 CSS pixels wide, check that only the
-   table region scrolls horizontally. Compare an inventory route at desktop
-   width: a single left nav, filter fields in one row, and a wide results
-   surface. At mobile width, all destinations and actions remain reachable.
-   Check that the sign-in and message shell has no workspace navigation.
+4. At 375 × 800 CSS pixels, open an Incus list with synthetic records. With the
+   menu closed, the search, scroll cue, and first result row should be visible
+   without vertical scrolling. Tab through the filter rail, including Apply
+   and Clear filters, and confirm it scrolls without moving the page sideways.
+5. At 320 CSS pixels (or equivalent zoom), use Enter or Space on Menu. Tab
+   through the workspace destinations and logout with no horizontal page
+   overflow. At desktop width, expect the labeled left sidebar and one filter
+   row. Check both themes and that sign-in and message pages have no workspace
+   navigation.

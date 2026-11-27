@@ -96,9 +96,14 @@ def _dashboard(path: str, title: str, body: str, username: str | None, csrf: str
   <div class="dashboard-layout">
     <div class="dashboard-sidebar">
       <div class="dashboard-brand">{_brand()}</div>
-      <nav class="dashboard-nav" aria-label="Workspace">
-        <ul>{"".join(links)}</ul>
-      </nav>{account}
+      <details class="dashboard-menu">
+        <summary aria-controls="dashboard-workspace">{_brand()} Menu</summary>
+      </details>
+      <div id="dashboard-workspace" class="dashboard-workspace">
+        <nav class="dashboard-nav" aria-label="Workspace">
+          <ul>{"".join(links)}</ul>
+        </nav>{account}
+      </div>
     </div>
     <main class="dashboard-main stack" id="main-content" tabindex="-1">
       <header class="dashboard-header"><h1>{heading}</h1></header>

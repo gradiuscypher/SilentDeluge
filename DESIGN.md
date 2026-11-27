@@ -12,8 +12,9 @@ synthetic evidence. The product fetches no design-library code, fonts or assets.
   links, signed-in account and logout together in the left sidebar; do not
   repeat them in a desktop masthead. Mark the active link with a left rule and
   stronger text as well as color. `aria-current="page"` marks an exact match;
-  `aria-current="location"` marks the parent of a nested route. Reflow the same
-  links into a short grid on narrow screens; no separate menu or hidden destinations.
+  `aria-current="location"` marks the parent of a nested route. Below 60rem,
+  replace the sidebar with a closed native Menu disclosure. Opening it reveals
+  the same labeled destinations, account and logout; only one layout is exposed.
   The sign-in and message shell has a narrow reading track and no workspace menu.
 - **Use width for data.** The primary track expands to about 1,800 CSS pixels.
   [GitHub Primer DataTable](https://primer.style/product/components/data-table/)
@@ -32,7 +33,8 @@ synthetic evidence. The product fetches no design-library code, fonts or assets.
 - **Keep filters and counts together.** Following Carbon's toolbar placement and
   [USWDS search guidance](https://designsystem.digital.gov/components/search/#guidance),
   put a labeled GET form above the results. Keep labels beside their fields
-  in one desktop row; wrap field pairs on small screens. Retain active values
+  in one desktop row. Below 60rem, keep search first and the controls on one
+  horizontally scrollable rail, with a visible scroll cue. Retain active values
   and use a real submit button and reset link. Place a `.summary` before the
   results with the visible range and total, or a clear empty state and reset.
   An empty filtered result is not evidence that an asset is absent.
@@ -49,10 +51,11 @@ synthetic evidence. The product fetches no design-library code, fonts or assets.
   badge text carries state even without color; adjacent text explains the basis
   and distinguishes unknown, absent and stale.
 - **Keep focus and layout intact.** [WCAG Reflow](https://www.w3.org/WAI/WCAG22/Understanding/reflow.html)
-  permits local scrolling for tables that need a two-dimensional layout, not
-  for their filters, title or pagination. Wrap ordinary tables; give genuinely
-  wide ones a named, keyboard-focusable `.table-scroll` container. Let controls
-  and text wrap at 320 CSS pixels. Keep a visible, persistent outline on
+  permits local scrolling for tables that need a two-dimensional layout.
+  Wrap ordinary tables; give genuinely wide ones a named, keyboard-focusable
+  `.table-scroll` container. Keep the page, title and pagination within the
+  viewport at 320 CSS pixels; tabbing must reach every control in the filter
+  rail. Keep a visible, persistent outline on
   controls and focusable jump targets per [WCAG Focus Visible](https://www.w3.org/WAI/WCAG22/Understanding/focus-visible.html).
   Compact navigation still provides at least 24 × 24 CSS pixel link targets,
   following [WCAG Target Size (Minimum)](https://www.w3.org/WAI/WCAG22/Understanding/target-size-minimum.html).

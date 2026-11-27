@@ -24,6 +24,15 @@ class Markup(HTMLParser):
     def start_tags(self, tag):
         return [event[2] for event in self.events if event[:2] == ("start", tag)]
 
+    def elements(self, tag):
+        starts = []
+        for index, event in enumerate(self.events):
+            if event[:2] == ("start", tag):
+                starts.append(index)
+            elif event == ("end", tag):
+                start = starts.pop()
+                yield self.events[start][2], self.events[start + 1:index]
+
 
 class WebDesignTest(unittest.TestCase):
     def test_shell_treats_title_as_text_and_renders_caller_markup_in_main(self):
@@ -69,32 +78,27 @@ class WebDesignTest(unittest.TestCase):
         self.assertEqual(doc.start_tags("review"), [])
         self.assertEqual(doc.start_tags("user"), [])
 
-        form, = doc.start_tags("form")
+        (form, fields), = doc.elements("form")
         self.assertEqual((form.get("method"), form.get("action")), ("post", "/logout"))
-        start = doc.events.index(("start", "form", form))
-        end = doc.events.index(("end", "form"), start)
-        fields = doc.events[start:end]
         token, = [event[2] for event in fields if event[:2] == ("start", "input")]
         self.assertEqual((token["type"], token["name"], token["value"]), ("hidden", "csrf", csrf))
+        submit, = [event[2] for event in fields if event[:2] == ("start", "button")]
+        self.assertEqual(submit.get("type"), "submit")
         self.assertIn(("text", "Log out"), fields)
 
     def test_dashboard_has_one_named_icon_and_text_link_per_section(self):
         doc = Markup(dashboard_page("/incus?section=runtime", "Incus", "", "operator", "token"))
-        nav, = doc.start_tags("nav")
-        self.assertTrue(nav["aria-label"])
-        nav_start = doc.events.index(("start", "nav", nav))
-        nav_end = doc.events.index(("end", "nav"), nav_start)
-        main, = doc.start_tags("main")
-        self.assertLess(nav_end, doc.events.index(("start", "main", main)))
+        (nav, contents), = doc.elements("nav")
+        self.assertEqual(nav.get("aria-label"), "Workspace")
         links = []
-        for index, event in enumerate(doc.events[nav_start:nav_end], nav_start):
+        for index, event in enumerate(contents):
             if event[:2] != ("start", "a"):
                 continue
             attrs = event[2]
-            end = doc.events.index(("end", "a"), index)
-            contents = doc.events[index + 1:end]
-            label, = [item[1] for item in contents if item[0] == "text"]
-            icon, = [item[2] for item in contents if item[:2] == ("start", "svg")]
+            end = contents.index(("end", "a"), index)
+            parts = contents[index + 1:end]
+            label, = [item[1] for item in parts if item[0] == "text"]
+            icon, = [item[2] for item in parts if item[:2] == ("start", "svg")]
             self.assertEqual(icon["aria-hidden"], "true")
             links.append((attrs["href"], label, attrs.get("aria-current")))
         self.assertEqual(links, [
@@ -104,18 +108,32 @@ class WebDesignTest(unittest.TestCase):
             ("/access", "Access", None), ("/patterns", "Design patterns", None),
         ])
 
+    def test_mobile_disclosure_starts_closed_and_controls_navigation_and_account_actions(self):
+        doc = Markup(dashboard_page("/incus", "Incus", "", "example operator", "token"))
+        (disclosure, contents), = doc.elements("details")
+        self.assertNotIn("open", disclosure)
+        self.assertEqual(contents[0][:2], ("start", "summary"))
+        summary = contents[0][2]
+        self.assertIn(("text", "Menu"), contents[:contents.index(("end", "summary"))])
+        (panel, menu), = [(attrs, parts) for attrs, parts in doc.elements("div")
+                          if attrs.get("id") == summary["aria-controls"]]
+        self.assertEqual(doc.events[doc.events.index(("end", "details")) + 1], ("start", "div", panel))
+        nav, = doc.start_tags("nav")
+        self.assertIn(("start", "nav", nav), menu)
+        self.assertIn(("text", "example operator"), menu)
+        logout, = doc.start_tags("form")
+        self.assertIn(("start", "form", logout), menu)
+
     def test_dashboard_nested_route_identifies_parent_without_marking_it_current_page(self):
         doc = Markup(dashboard_page("/collectors/new", "New collector", "", "operator", "token"))
-        current, = [link for link in doc.start_tags("a") if "aria-current" in link]
-        self.assertEqual((current["href"], current["aria-current"]), ("/collectors", "location"))
+        current = [(link["href"], link["aria-current"]) for link in doc.start_tags("a") if "aria-current" in link]
+        self.assertEqual(current, [("/collectors", "location")])
 
     def test_patterns_share_dashboard_navigation_and_only_authenticated_example_offers_logout(self):
         for doc, authenticated in ((Markup(patterns()), False),
                                    (Markup(patterns("example operator", "example token")), True)):
-            nav, = [nav for nav in doc.start_tags("nav") if nav.get("aria-label") == "Workspace"]
-            start = doc.events.index(("start", "nav", nav))
-            end = doc.events.index(("end", "nav"), start)
-            current, = [event[2]["href"] for event in doc.events[start:end]
+            (contents,) = [parts for nav, parts in doc.elements("nav") if nav.get("aria-label") == "Workspace"]
+            current, = [event[2]["href"] for event in contents
                         if event[:2] == ("start", "a") and event[2].get("aria-current") == "page"]
             self.assertEqual(current, "/patterns")
             heading, = doc.start_tags("h1")
@@ -146,12 +164,10 @@ class WebDesignTest(unittest.TestCase):
         self.assertEqual(expected - labels, set())
 
     def test_patterns_fragment_links_land_on_focusable_targets(self):
-        doc = Markup(patterns())
-        targets = {
-            event[2]["id"]: event[2]
-            for event in doc.events
-            if event[0] == "start" and "id" in event[2]
-        }
+        doc = Markup(patterns("example operator", "token"))
+        target_attrs = [event[2] for event in doc.events if event[0] == "start" and "id" in event[2]]
+        targets = {attrs["id"]: attrs for attrs in target_attrs}
+        self.assertEqual(len(targets), len(target_attrs), "IDs must be unique across responsive layouts")
         fragments = {
             link["href"][1:] for link in doc.start_tags("a") if link["href"].startswith("#")
         }
