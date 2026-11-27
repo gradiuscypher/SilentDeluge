@@ -1,0 +1,5 @@
+{
+  "scope": "theatre/stage", "source": "synthetic stage plan", "timestamp": "2025-01-01T09:00:00Z",
+  "containers": [{"name": "paper-moon"}],
+  "vms": [{"name": "tin-piano", "cpu": "4"}]
+}

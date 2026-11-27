@@ -2,12 +2,26 @@
 
 SilentDeluge is a proposed open-source monitoring system for homelabs, personal computers, and network devices. Its first job is to answer a small question reliably: **which Incus guests did I declare, which were observed, and where do they disagree?**
 
-**Status: offline Incus inventory slice.** The local command reads JSON files only. It does not install a collector, contact a host, or configure CI.
+**Status: offline Incus inventory slice.** The commands read local evidence files. Neither installs a collector or contacts a host.
 
 - [Milestone plan](PLAN.md): first deliverable, local verification, and the public/private boundary.
 - [Domain glossary](CONTEXT.md): agreed meanings and constraints for inventory, permissions, monitoring, and evidence.
 - [Incus provider setup handoff](INCUS-SETUP.md): private identity provisioning, verification, and one-scan acceptance.
 - [MIT license](LICENSE): license for original project material.
+
+## Inventory from saved metrics
+
+```sh
+python3 metrics_inventory.py examples/runtime-declarations.json examples/runtime.prom \
+  --scope theatre/stage --source synthetic-capture --timestamp 2025-01-01T10:00:00Z
+```
+
+Supply the capture's server/project and observation time, not the replay time.
+CPU-time and boot-time samples identify running guests at capture time; repeated
+series count once. A missing guest is unknown. Null observed limits mean unknown,
+not unset. A null declaration means observed but undeclared. The JSON report is
+partial evidence, not a scan input for the complete-inventory command below.
+Keep real captures, declarations and output in a private directory outside Git.
 
 ## Try the inventory locally
 
