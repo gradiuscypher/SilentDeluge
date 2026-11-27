@@ -68,6 +68,14 @@ class IncusSourceTest(unittest.TestCase):
             {'instances': [dict(_INSTANCE, status=None)]},
             {'instances': [dict(_INSTANCE, expanded_config=None)]},
             {'instances': [dict(_INSTANCE, expanded_config={'limits.cpu': {}})]},
+            {'instances': [dict(_INSTANCE, architecture={})]},
+            {'instances': [dict(_INSTANCE, location=' stage-left')]},
+            {'instances': [dict(_INSTANCE, profiles=['default', {'config': 'synthetic-secret'}])]},
+            {'instances': [dict(_INSTANCE, ephemeral=0)]},
+            {'instances': [dict(_INSTANCE, created_at='2025-01-01T10:10:00')]},
+            {'instances': [dict(_INSTANCE, last_used_at='synthetic-secret')]},
+            {'instances': [dict(_INSTANCE, project='synthetic-secret')]},
+            {'project': 'synthetic-secret'},
             {'instances': [_INSTANCE, dict(_INSTANCE, type='container')]},
         ):
             with self.subTest(overrides=overrides):
@@ -97,6 +105,57 @@ class IncusSourceTest(unittest.TestCase):
             section='runtime', outcome='partial', timestamp=_METRICS_STAMP, records=[],
         )])
 
+    def test_runtime_preserves_scoped_measurements_without_raw_labels(self):
+        metrics = Path(self.directory) / 'measured.prom'
+        metrics.write_text('''\
+incus_cpu_seconds_total{project="stage",name="tin-piano",type="virtual-machine",cpu="0",mode="user",private="synthetic"} 4.25
+incus_cpu_seconds_total{project="stage",name="tin-piano",type="virtual-machine",cpu="0",mode="user"} 4.25
+incus_cpu_seconds_total{project="stage",name="tin-piano",type="virtual-machine",mode="system"} 0
+incus_cpu_seconds_total{project="stage",name="tin-piano",type="virtual-machine",cpu="0",mode="idle"} 1000
+incus_cpu_seconds_total{project="stage",name="tin-piano",type="virtual-machine",cpu="private",mode="user"} 10
+incus_memory_MemAvailable_bytes{project="stage",name="tin-piano",type="virtual-machine"} 2.5e3
+incus_memory_MemTotal_bytes{project="stage",name="tin-piano",type="virtual-machine"} 8192
+incus_boot_time_seconds{project="stage",name="tin-piano",type="virtual-machine"} 1000
+incus_time_seconds{project="stage",name="tin-piano",type="virtual-machine"} 1123
+incus_memory_RSS_bytes{project="stage",name="trapdoor",type="container"} 12000
+incus_memory_RSS_bytes{project="backstage",name="trapdoor",type="container"} 5000
+incus_memory_RSS_bytes{name="unscoped",type="container"} 5000
+incus_uptime_seconds{project="stage",name="daemon",type="container"} 50000
+incus_project_usage{project="stage",name="daemon",type="container"} 50000
+''', encoding='utf-8')
+        capture = dict(source='incus-prometheus', scope=_SCOPE, timestamp=_METRICS_STAMP)
+        self.assertEqual(collect(dict(scope=_SCOPE, metrics_path=str(metrics),
+                                      metrics_timestamp=_METRICS_STAMP)), [dict(
+            section='runtime', outcome='partial', timestamp=_METRICS_STAMP, records=[
+                dict(name='tin-piano', kind='virtual-machine', state='running', capture=capture,
+                     measurements=dict(uptime_seconds=123, memory_available_bytes=2500,
+                                       cpu_seconds_total=[dict(mode='system', seconds=0),
+                                                          dict(cpu_index=0, mode='user', seconds=4.25)])),
+                dict(name='trapdoor', kind='container', state='running', capture=capture,
+                     measurements=dict(memory_rss_bytes=12000)),
+            ],
+        )])
+
+    def test_runtime_does_not_invent_missing_or_unmeasured_values(self):
+        metrics = Path(self.directory) / 'unmeasured.prom'
+        metrics.write_text('''\
+incus_boot_time_seconds{project="stage",name="tin-piano",type="virtual-machine"} 0
+incus_time_seconds{project="stage",name="tin-piano",type="virtual-machine"} 0
+incus_memory_MemAvailable_bytes{project="stage",name="tin-piano",type="virtual-machine"} 1024
+incus_memory_MemTotal_bytes{project="stage",name="tin-piano",type="virtual-machine"} 8192
+incus_boot_time_seconds{project="stage",name="trapdoor",type="container"} 1124
+incus_time_seconds{project="stage",name="trapdoor",type="container"} 1123
+incus_memory_RSS_bytes{project="stage",name="trapdoor",type="container"} NaN
+incus_cpu_seconds_total{project="stage",name="trapdoor",type="container",cpu="0",mode="system"} +Inf
+''', encoding='utf-8')
+        self.assertEqual(collect(dict(scope=_SCOPE, metrics_path=str(metrics),
+                                      metrics_timestamp=_METRICS_STAMP)), [dict(
+            section='runtime', outcome='partial', timestamp=_METRICS_STAMP, records=[
+                dict(name='tin-piano', kind='virtual-machine', state='running'),
+                dict(name='trapdoor', kind='container', state='running'),
+            ],
+        )])
+
     def test_combined_input_keeps_capture_times_and_authority_separate(self):
         self.write_snapshot(instances=[_INSTANCE])
         inventory, runtime = collect(dict(self.config, metrics_path=str(_EXAMPLES / 'runtime.prom'),
@@ -114,24 +173,53 @@ class IncusSourceTest(unittest.TestCase):
             with self.subTest(overrides=overrides), self.assertRaises(ValueError):
                 collect(dict(config, **overrides))
 
-    def test_operator_export_strips_every_non_inventory_field(self):
+    def test_operator_export_round_trips_only_allowlisted_inventory_fields(self):
+        details = dict(architecture='x86_64', location='stage-left', profiles=['default', 'music'],
+                       ephemeral=False, created_at='2025-01-01T09:30:00Z',
+                       last_used_at='2025-01-01T11:00:00+01:00')
         response = dict(type='sync', status_code=200, metadata=[dict(
-            _INSTANCE, config={'limits.cpu': '1', 'user.private': 'synthetic-local'},
+            _INSTANCE, **details, project='stage', config={'limits.cpu': '1', 'user.private': 'synthetic-local'},
             expanded_config=dict(_INSTANCE['expanded_config'], **{'user.private': 'synthetic-inherited'}),
-            devices={'synthetic-device': {'path': '/synthetic'}},
+            devices={'synthetic-device': {'path': '/synthetic'}}, description='synthetic-description',
         )])
         document = _export_document(response, _SCOPE, _STAMP)
-        self.assertEqual(document['instances'], [_INSTANCE])
+        self.assertEqual(document, dict(source='incus-operator-export', scope=_SCOPE, timestamp=_STAMP,
+                                        outcome='complete', instances=[dict(_INSTANCE, **details)]))
         self.snapshot.write_text(json.dumps(document), encoding='utf-8')
         self.assertEqual(collect(self.config), [dict(
             section='instances', outcome='complete', timestamp=_STAMP, records=[
-                dict(name='tin-piano', kind='virtual-machine', state='Stopped', cpu='2-3', memory='2GiB'),
+                dict(name='tin-piano', kind='virtual-machine', state='Stopped',
+                     cpu='2-3', memory='2GiB', **details),
             ],
         )])
 
+    def test_operator_export_handles_unset_optional_fields_without_defaults(self):
+        response = dict(type='sync', status_code=200, metadata=[
+            dict(name='tin-piano', type='virtual-machine', status='Stopped', expanded_config={},
+                 location='', profiles=[], last_used_at='0001-01-01T00:00:00Z'),
+        ])
+        self.assertEqual(_export_document(response, _SCOPE, _STAMP)['instances'], [
+            dict(name='tin-piano', type='virtual-machine', status='Stopped', expanded_config={}, profiles=[]),
+        ])
+
+    def test_operator_export_rejects_a_returned_guest_from_another_project(self):
+        response = dict(type='sync', status_code=200, metadata=[
+            dict(_INSTANCE, project='stage'),
+            dict(_INSTANCE, name='trapdoor', project='synthetic-wrong-project'),
+        ])
+        with self.assertRaisesRegex(ValueError, '^Incus inventory project does not match configured scope$'):
+            _export_document(response, _SCOPE, _STAMP)
+
     def test_export_error_or_missing_inventory_is_not_an_empty_success(self):
         for response in (dict(type='error', status_code=403, metadata=[]),
-                         dict(type='sync', status_code=200)):
+                         dict(type='sync', status_code=200),
+                         dict(type='sync', status_code=200, metadata=[
+                             dict(name='tin-piano', type='virtual-machine', status='Error'),
+                         ]),
+                         dict(type='sync', status_code=200, metadata=[
+                             _INSTANCE,
+                             dict(name='trapdoor', type='container', status='Stopped'),
+                         ])):
             with self.subTest(response=response), self.assertRaises(ValueError):
                 _export_document(response, _SCOPE, _STAMP)
 

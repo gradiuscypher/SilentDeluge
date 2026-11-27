@@ -1,5 +1,6 @@
 """Collect explicitly enabled, local Linux guest evidence without elevated access."""
 
+from contextlib import contextmanager, ExitStack
 import os
 from pathlib import Path
 import re
@@ -19,6 +20,20 @@ _DPKG_STATES = {
 }
 _PACKAGE_FIELD = re.compile(r'[A-Za-z0-9][A-Za-z0-9.+_~:-]*')
 _CGROUP = '/sys/fs/cgroup/'
+_RELEASE_VALUE = re.compile(r"""(['"]?)([a-z0-9._-]*)\1""")
+_KERNEL_VALUE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._+-]*')
+_STORAGE_PATHS = ('/', '/boot', '/boot/efi', '/usr', '/var')
+_STORAGE_TYPES = frozenset(
+    'bcachefs btrfs erofs exfat ext2 ext3 ext4 f2fs jfs ntfs3 overlay '
+    'squashfs tmpfs vfat xfs zfs'.split()
+)
+_SYSTEMD_DIRS = (
+    '/etc/systemd/system', '/run/systemd/system', '/usr/local/lib/systemd/system',
+    '/usr/lib/systemd/system', '/lib/systemd/system',
+)
+_SYSTEMD_NAME = re.compile(r'[A-Za-z0-9:_.-]+@?\.service')
+_OPENRC_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*')
+_OPERSTATES = {'unknown', 'notpresent', 'down', 'lowerlayerdown', 'testing', 'dormant', 'up'}
 
 
 def _open(path):
@@ -32,6 +47,69 @@ def _uint(text):
     if value >= 2**64:
         raise ValueError('counter exceeds Linux unsigned range')
     return value
+
+
+def _os_release():
+    try:
+        stream = _open('/etc/os-release')
+    except FileNotFoundError:
+        stream = _open('/usr/lib/os-release')
+    release = {}
+    with stream:
+        for line in stream:
+            key, _, value = line.rstrip('\n').partition('=')
+            if key not in ('ID', 'VERSION_ID'):
+                continue
+            match = _RELEASE_VALUE.fullmatch(value)
+            if key in release or match is None:
+                raise ValueError('invalid OS release metadata')
+            release[key] = match[2] or None
+    if not release.get('ID'):
+        raise ValueError('OS ID unavailable')
+    return release['ID'], release.get('VERSION_ID')
+
+
+def _boot_time():
+    with _open('/proc/stat') as stream:
+        for line in stream:
+            key, _, value = line.partition(' ')
+            if key == 'btime':
+                return _uint(value.strip())
+    raise ValueError('boot time unavailable')
+
+
+def _system(_config):
+    os_id, os_version = _os_release()
+    kernel = os.uname()
+    if not all(_KERNEL_VALUE.fullmatch(value) for value in (kernel.release, kernel.machine)):
+        raise ValueError('invalid kernel identity')
+    with _open('/proc/uptime') as stream:
+        fields = stream.readline().split()
+    if len(fields) != 2 or not re.fullmatch(r'[0-9]+\.[0-9]{2}', fields[0]):
+        raise ValueError('uptime unavailable')
+    seconds, centiseconds = fields[0].split('.')
+    uptime = _uint(seconds) + int(centiseconds) / 100
+    return [dict(os_id=os_id, os_version=os_version, kernel_release=kernel.release,
+                 architecture=kernel.machine, boot_time_unix_seconds=_boot_time(),
+                 uptime_seconds=uptime)]
+
+
+@contextmanager
+def _directory(path, *, read=False):
+    # Limit resolution to the literal system paths, even if a component is a
+    # symlink. O_PATH ancestors need search, not directory-list permissions.
+    flags = os.O_DIRECTORY | os.O_NOFOLLOW
+    parts = path[1:].split('/') if path != '/' else ()
+    fd = os.open('/', flags | (os.O_RDONLY if read and not parts else os.O_PATH))
+    try:
+        for index, part in enumerate(parts):
+            mode = os.O_RDONLY if read and index == len(parts) - 1 else os.O_PATH
+            child = os.open(part, flags | mode, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        yield fd
+    finally:
+        os.close(fd)
 
 
 def _package_rows(stream, fields):
@@ -163,13 +241,99 @@ def _memory(config):
     return [dict(view=view, **sizes)]
 
 
-def _disk(_config):
-    stats = os.statvfs('/')
+def _filesystem_usage(stats):
     if stats.f_frsize <= 0 or not 0 <= stats.f_bavail <= stats.f_bfree <= stats.f_blocks:
         raise ValueError('invalid filesystem block counts')
-    return [dict(path='/', total_bytes=stats.f_blocks * stats.f_frsize,
-                 used_bytes=(stats.f_blocks - stats.f_bfree) * stats.f_frsize,
-                 available_bytes=stats.f_bavail * stats.f_frsize)]
+    return dict(total_bytes=stats.f_blocks * stats.f_frsize,
+                used_bytes=(stats.f_blocks - stats.f_bfree) * stats.f_frsize,
+                available_bytes=stats.f_bavail * stats.f_frsize)
+
+
+def _disk(_config):
+    return [dict(path='/', **_filesystem_usage(os.statvfs('/')))]
+
+
+def _storage(_config):
+    mounts = {}
+    with _open('/proc/self/mountinfo') as stream:
+        for line in stream:
+            before, sep, after = line.partition(' - ')
+            fields, filesystem = before.split(), after.split(maxsplit=2)
+            if not sep or len(fields) < 6 or len(filesystem) != 3:
+                raise ValueError('invalid mount table')
+            root, path = fields[3:5]
+            if path not in _STORAGE_PATHS:
+                continue
+            if path in mounts:
+                raise ValueError('ambiguous mount at a scoped path')
+            mounts[path] = root, filesystem[0]
+    if '/' not in mounts:
+        raise ValueError('root mount unavailable')
+
+    records = []
+    for path in _STORAGE_PATHS:
+        if path not in mounts:
+            continue
+        root, filesystem = mounts[path]
+        if path != '/' and root != '/':
+            continue  # Do not inspect non-root subtree mounts.
+        if filesystem not in _STORAGE_TYPES:
+            raise ValueError('unsupported filesystem at a scoped path')
+        with _directory(path) as fd:
+            usage = _filesystem_usage(os.fstatvfs(fd))
+        records.append(dict(path=path, filesystem=filesystem, **usage))
+    return records
+
+
+def _usr_merged_lib():
+    try:
+        return os.readlink('/lib') in ('/usr/lib', 'usr/lib')
+    except OSError:
+        return False
+
+
+def _systemd_services():
+    seen_directory = False
+    services = {}
+    for path in _SYSTEMD_DIRS:
+        with ExitStack() as stack:
+            try:
+                fd = stack.enter_context(_directory(path, read=True))
+            except FileNotFoundError:
+                continue
+            except NotADirectoryError:
+                if path == '/lib/systemd/system' and _usr_merged_lib():
+                    continue
+                raise
+            with os.scandir(fd) as entries:
+                seen_directory = True
+                for entry in entries:
+                    name = entry.name
+                    if name in services or not _SYSTEMD_NAME.fullmatch(name):
+                        continue
+                    if entry.is_symlink():
+                        target = os.readlink(name, dir_fd=fd)
+                        services[name] = 'masked' if target == '/dev/null' else 'linked'
+                    elif entry.is_file(follow_symlinks=False):
+                        services[name] = 'installed'
+    if not seen_directory:
+        raise ValueError('supported systemd directories unavailable')
+    return [dict(manager='systemd', name=name, state=services[name]) for name in sorted(services)]
+
+
+def _openrc_services():
+    with _directory('/run/openrc/started', read=True) as fd, os.scandir(fd) as entries:
+        names = sorted(entry.name for entry in entries if _OPENRC_NAME.fullmatch(entry.name))
+    return [dict(manager='openrc', name=name, state='started') for name in names]
+
+
+def _services(config):
+    manager = config.get('service_manager', 'systemd')
+    if manager == 'systemd':
+        return _systemd_services()
+    if manager == 'openrc':
+        return _openrc_services()
+    raise ValueError('no supported service view selected')
 
 
 def _users(_config):
@@ -194,8 +358,36 @@ def _interfaces(_config):
             sorted(socket.if_nameindex(), key=lambda interface: interface[1])]
 
 
+def _link_value(base, attribute):
+    with _open(base + attribute) as stream:
+        return stream.read().strip()
+
+
+def _network_links(config):
+    records = _interfaces(config)
+    for link in records:
+        name = link['name']
+        if not name or not name.isprintable() or name in ('.', '..') or '/' in name:
+            raise ValueError('invalid interface name')
+        base = f'/sys/class/net/{name}/'
+        ifindex = _uint(_link_value(base, 'ifindex'))
+        if ifindex != link['ifindex']:
+            raise ValueError('interface index does not match namespace')
+        state = _link_value(base, 'operstate')
+        if state not in _OPERSTATES:
+            raise ValueError('invalid interface operational state')
+        link.update(
+            operstate=state, mtu_bytes=_uint(_link_value(base, 'mtu')),
+            arphrd_type=_uint(_link_value(base, 'type')),
+            rx_bytes=_uint(_link_value(base, 'statistics/rx_bytes')),
+            tx_bytes=_uint(_link_value(base, 'statistics/tx_bytes')),
+        )
+    return records
+
+
 _COLLECTORS = dict(packages=_packages, cpu=_cpu, memory=_memory, disk=_disk,
-                   users=_users, interfaces=_interfaces)
+                   users=_users, interfaces=_interfaces, system=_system, storage=_storage,
+                   services=_services, network_links=_network_links)
 
 
 def collect(config):

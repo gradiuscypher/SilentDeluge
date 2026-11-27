@@ -5,6 +5,7 @@ must not be returned as a successful empty inventory.
 """
 
 from collections import deque
+from contextlib import nullcontext
 from io import StringIO
 from types import SimpleNamespace
 import unittest
@@ -19,8 +20,19 @@ class LocalLinuxInventory(unittest.TestCase):
         self.open = self.enterContext(patch('source_linux.Path.open', autospec=True,
                                             side_effect=self.open_fixture))
         self.platform = self.enterContext(patch('source_linux.sys', platform='linux'))
-        self.disk = self.enterContext(patch('source_linux.os.statvfs', create=True,
-                                            side_effect=AssertionError('unexpected disk read')))
+        self.os = self.enterContext(patch('source_linux.os'))
+        self.os.O_DIRECTORY, self.os.O_NOFOLLOW, self.os.O_PATH, self.os.O_RDONLY = 1, 2, 4, 0
+        self.disk = self.os.statvfs
+        self.disk.side_effect = AssertionError('unexpected disk read')
+        self.os.uname.return_value = SimpleNamespace(
+            release='6.12.3-toy', machine='aarch64', nodename='synthetic-private-hostname',
+        )
+        self.directories, self.descriptors, self.links, self.filesystems = {'/': ()}, {}, {}, {}
+        self.os.open.side_effect = self.open_directory_fixture
+        self.os.close.side_effect = self.descriptors.pop
+        self.os.scandir.side_effect = lambda fd: nullcontext(iter(self.directories[self.descriptors[fd]]))
+        self.os.readlink.side_effect = self.readlink_fixture
+        self.os.fstatvfs.side_effect = lambda fd: self.filesystems[self.descriptors[fd]]
         self.interfaces = self.enterContext(patch('source_linux.socket.if_nameindex',
                                                   side_effect=AssertionError('unexpected interface read')))
         self.enterContext(patch('source_linux.sleep'))
@@ -34,6 +46,41 @@ class LocalLinuxInventory(unittest.TestCase):
             raise text
         return StringIO(text)
 
+    def add_directory(self, path, entries=()):
+        self.directories[path] = entries
+        while path != '/':
+            path = path.rpartition('/')[0] or '/'
+            self.directories.setdefault(path, ())
+
+    def open_directory_fixture(self, name, flags, *, dir_fd=None):
+        self.assertEqual(flags & (self.os.O_NOFOLLOW | self.os.O_DIRECTORY), 3)
+        if dir_fd is None:
+            self.assertEqual(name, '/')
+            path = name
+        else:
+            self.assertNotIn('/', name)
+            path = f"{self.descriptors[dir_fd].rstrip('/')}/{name}"
+        if path in self.links:
+            raise NotADirectoryError(path)
+        if path not in self.directories:
+            raise FileNotFoundError(path)
+        if isinstance(self.directories[path], OSError):
+            raise self.directories[path]
+        fd = max(self.descriptors, default=9) + 1
+        self.descriptors[fd] = path
+        return fd
+
+    def readlink_fixture(self, name, *, dir_fd=None):
+        path = name if dir_fd is None else f'{self.descriptors[dir_fd]}/{name}'
+        if path not in self.links:
+            raise FileNotFoundError(path)
+        return self.links[path]
+
+    @staticmethod
+    def entry(name, kind='file'):
+        return SimpleNamespace(name=name, is_symlink=lambda: kind == 'link',
+                               is_file=lambda *, follow_symlinks: kind == 'file' and not follow_symlinks)
+
     def run_packs(self, *packs, **options):
         return collect(dict(scope='toy-theatre/paper-moon', packs=list(packs), **options))
 
@@ -46,6 +93,10 @@ class LocalLinuxInventory(unittest.TestCase):
         self.open.assert_not_called()
         self.disk.assert_not_called()
         self.interfaces.assert_not_called()
+        self.os.uname.assert_not_called()
+        self.os.open.assert_not_called()
+        self.os.scandir.assert_not_called()
+        self.os.fstatvfs.assert_not_called()
         self.clock.assert_not_called()
 
     def test_dpkg_keeps_only_installed_package_identity_and_version(self):
@@ -155,6 +206,149 @@ class LocalLinuxInventory(unittest.TestCase):
                 dict(section='memory', outcome='failed', records=[]),
             ],
         )
+
+    def test_system_emits_only_release_kernel_and_visible_boot_context(self):
+        self.inputs.update({
+            '/etc/os-release': "PRETTY_NAME='Synthetic private title'\nID=toyos\nVERSION_ID=\"24.03\"\n",
+            '/proc/stat': 'cpu 0 0 0 0\nbtime 1700000000\nprocesses 100\n',
+            '/proc/uptime': '612.35 1004.79\n',
+        })
+        self.assertEqual(self.run_packs('system'), [dict(section='system', outcome='complete', records=[
+            dict(asset='toy-theatre/paper-moon', os_id='toyos', os_version='24.03',
+                 kernel_release='6.12.3-toy', architecture='aarch64',
+                 boot_time_unix_seconds=1_700_000_000, uptime_seconds=612.35),
+        ])])
+
+    def test_system_supports_a_rolling_release_but_does_not_hide_unreadable_metadata(self):
+        self.inputs.update({
+            '/etc/os-release': FileNotFoundError(),
+            '/usr/lib/os-release': "ID='rolling-toy'\n",
+            '/proc/stat': 'btime 1700000000\n',
+            '/proc/uptime': '12.50 1.00\n',
+        })
+        result, = self.run_packs('system')
+        self.assertEqual(result['outcome'], 'complete')
+        self.assertIsNone(result['records'][0]['os_version'])
+
+        self.inputs['/etc/os-release'] = PermissionError('synthetic denied detail')
+        self.assertEqual(self.run_packs('system'), [dict(section='system', outcome='failed', records=[])])
+
+    def test_storage_queries_only_scoped_mounts_and_drops_sources_and_subtrees(self):
+        self.inputs['/proc/self/mountinfo'] = (
+            '31 30 0:41 /@ / rw - btrfs /dev/synthetic-root rw\n'
+            '32 31 8:6 / /boot/efi ro - vfat /dev/synthetic-boot ro\n'
+            '33 31 0:43 / /run/secrets rw - tmpfs secret-token rw\n'
+            '34 31 0:44 / /home/toy\\040person rw - ext4 /dev/synthetic-home rw\n'
+            '35 31 0:45 /home/toy /var rw - ext4 /dev/synthetic-bind rw\n'
+            '36 31 0:46 / /mnt/toy rw - nfs remote.test:/credentials rw\n'
+        )
+        self.add_directory('/boot/efi')
+        self.filesystems.update({
+            '/': SimpleNamespace(f_frsize=4096, f_blocks=100, f_bfree=30, f_bavail=25),
+            '/boot/efi': SimpleNamespace(f_frsize=512, f_blocks=200, f_bfree=25, f_bavail=25),
+        })
+        result, = self.run_packs('storage')
+        self.assertEqual(result, dict(section='storage', outcome='complete', records=[
+            dict(asset='toy-theatre/paper-moon', path='/', filesystem='btrfs',
+                 total_bytes=409_600, used_bytes=286_720, available_bytes=102_400),
+            dict(asset='toy-theatre/paper-moon', path='/boot/efi', filesystem='vfat',
+                 total_bytes=102_400, used_bytes=89_600, available_bytes=12_800),
+        ]))
+        self.os.scandir.assert_not_called()
+
+    def test_storage_does_not_probe_unsupported_or_ambiguous_mounts(self):
+        for mountinfo in (
+            '31 30 0:41 / / rw - nfs remote.test:/toy rw\n',
+            '31 30 0:41 / / rw - xfs /dev/synthetic rw\n'
+            '32 31 0:42 / / rw - overlay overlay rw\n',
+            '',
+        ):
+            with self.subTest(mountinfo=mountinfo):
+                self.inputs['/proc/self/mountinfo'] = mountinfo
+                self.assertEqual(self.run_packs('storage'), [
+                    dict(section='storage', outcome='failed', records=[]),
+                ])
+        self.os.fstatvfs.assert_not_called()
+
+    def test_systemd_service_names_include_masks_and_do_not_follow_linked_units(self):
+        self.add_directory('/etc/systemd/system', [
+            self.entry('curtain.service', 'link'),
+            self.entry('guest.service', 'link'),
+            self.entry('toy.target'),
+            self.entry('toy.target.wants', 'directory'),
+        ])
+        self.add_directory('/usr/lib/systemd/system', [
+            self.entry('curtain.service'),
+            self.entry('lights.service'),
+            self.entry('spot@.service'),
+            self.entry('spot@home-toy.service'),
+        ])
+        self.links.update({
+            '/lib': 'usr/lib',
+            '/etc/systemd/system/curtain.service': '/dev/null',
+            '/etc/systemd/system/guest.service': '/home/toy/private.service',
+        })
+        result, = self.run_packs('services')
+        self.assertEqual(result, dict(section='services', outcome='complete', records=[
+            dict(asset='toy-theatre/paper-moon', manager='systemd', name='curtain.service', state='masked'),
+            dict(asset='toy-theatre/paper-moon', manager='systemd', name='guest.service', state='linked'),
+            dict(asset='toy-theatre/paper-moon', manager='systemd', name='lights.service', state='installed'),
+            dict(asset='toy-theatre/paper-moon', manager='systemd', name='spot@.service', state='installed'),
+        ]))
+        self.open.assert_not_called()
+
+    def test_services_distinguishes_empty_systemd_directory_from_missing_or_unreadable(self):
+        failed = dict(section='services', outcome='failed', records=[])
+        self.assertEqual(self.run_packs('services'), [failed])
+        self.add_directory('/usr/lib/systemd/system')
+        self.assertEqual(self.run_packs('services'), [dict(section='services', outcome='complete', records=[])])
+        self.add_directory('/etc/systemd/system', PermissionError('synthetic denied detail'))
+        self.assertEqual(self.run_packs('services'), [failed])
+        self.assertEqual(self.run_packs('services', service_manager='toy-init'), [failed])
+
+    def test_openrc_reports_started_markers_only_from_the_selected_view(self):
+        self.add_directory('/run/openrc/started', [self.entry('toy-daemon', 'link'), self.entry('.hidden')])
+        result, = self.run_packs('services', service_manager='openrc')
+        self.assertEqual(result, dict(section='services', outcome='complete', records=[
+            dict(asset='toy-theatre/paper-moon', manager='openrc', name='toy-daemon', state='started'),
+        ]))
+        self.os.readlink.assert_not_called()
+        self.open.assert_not_called()
+
+    def test_network_links_reports_kernel_state_type_mtu_and_unsigned_byte_counters(self):
+        self.interfaces.side_effect = None
+        self.interfaces.return_value = [(7, 'eth-toy'), (1, 'lo')]
+        for name, index, state, mtu, link_type, rx, tx in (
+            ('eth-toy', 7, 'lowerlayerdown', 1500, 1, 9_223_372_036_854_775_810, 21),
+            ('lo', 1, 'unknown', 65536, 772, 512, 512),
+        ):
+            base = f'/sys/class/net/{name}/'
+            self.inputs.update({base + field: f'{value}\n' for field, value in (
+                ('ifindex', index), ('operstate', state), ('mtu', mtu), ('type', link_type),
+                ('statistics/rx_bytes', rx), ('statistics/tx_bytes', tx),
+            )})
+        result, = self.run_packs('network_links')
+        self.assertEqual((result['section'], result['outcome']), ('network_links', 'complete'))
+        self.assertCountEqual(result['records'], [
+            dict(asset='toy-theatre/paper-moon', name='lo', ifindex=1,
+                 operstate='unknown', mtu_bytes=65_536, arphrd_type=772, rx_bytes=512, tx_bytes=512),
+            dict(asset='toy-theatre/paper-moon', name='eth-toy', ifindex=7,
+                 operstate='lowerlayerdown', mtu_bytes=1500, arphrd_type=1,
+                 rx_bytes=9_223_372_036_854_775_810, tx_bytes=21),
+        ])
+
+    def test_network_links_does_not_claim_empty_or_reuse_a_mismatched_sysfs_view(self):
+        self.interfaces.side_effect = None
+        self.interfaces.return_value = []
+        self.assertEqual(self.run_packs('network_links'), [
+            dict(section='network_links', outcome='complete', records=[]),
+        ])
+        self.interfaces.return_value = [(7, 'eth-toy')]
+        for ifindex in ('8\n', PermissionError('synthetic denied detail')):
+            self.inputs['/sys/class/net/eth-toy/ifindex'] = ifindex
+            self.assertEqual(self.run_packs('network_links'), [
+                dict(section='network_links', outcome='failed', records=[]),
+            ])
 
 
 if __name__ == '__main__':
