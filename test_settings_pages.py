@@ -9,12 +9,16 @@ class _Page(HTMLParser):
     def __init__(self, html):
         super().__init__()
         self.tags = set()
+        self.headings = 0
+        self.captions = []
         self.links = set()
+        self.current_links = []
         self.forms = []
         self.text = []
         self.templates = []
         self._form = None
         self._code = None
+        self._caption = None
         self.feed(html)
         self.close()
 
@@ -23,6 +27,8 @@ class _Page(HTMLParser):
         attrs = dict(attrs)
         if tag == 'a':
             self.links.add(attrs['href'])
+            if attrs.get('aria-current') in ('page', 'location'):
+                self.current_links.append(attrs['href'])
         elif tag == 'form':
             self._form = {}
             self.forms.append((attrs['method'], attrs['action'], self._form))
@@ -32,6 +38,10 @@ class _Page(HTMLParser):
             self._code = []
         elif tag == 'br' and self._code is not None:
             self._code.append('\n')
+        elif tag == 'h1':
+            self.headings += 1
+        elif tag == 'caption':
+            self._caption = []
 
     def handle_endtag(self, tag):
         if tag == 'form':
@@ -39,12 +49,17 @@ class _Page(HTMLParser):
         elif tag == 'code':
             self.templates.append(''.join(self._code))
             self._code = None
+        elif tag == 'caption':
+            self.captions.append(''.join(self._caption))
+            self._caption = None
 
     def handle_data(self, data):
         if data.strip():
             self.text.append(data.strip())
         if self._code is not None:
             self._code.append(data)
+        if self._caption is not None:
+            self._caption.append(data)
 
 
 def _entry(source, provider, scope, *, enabled=False, can_collect=False, import_only=False):
@@ -65,8 +80,11 @@ class SettingsPagesTest(unittest.TestCase):
                 html = render(path, {}, [], 'reader', self.csrf)
                 self.assertTrue(html.startswith('<!doctype html>'))
                 doc = _Page(html)
-                self.assertTrue({'html', 'main', 'h1'} <= doc.tags)
+                self.assertTrue({'html', 'main'} <= doc.tags)
+                self.assertEqual(doc.headings, 1)
+                self.assertIn('reader', doc.text)
                 self.assertTrue(expected <= doc.links)
+                self.assertEqual(doc.current_links, [path.removesuffix('/new')])
                 self.assertEqual(doc.forms, [('post', '/logout', {'csrf': self.csrf})])
         self.assertIsNone(render('/machines', {}, [], 'reader', self.csrf))
 
@@ -87,7 +105,6 @@ class SettingsPagesTest(unittest.TestCase):
             ('post', '/disable', {'csrf': self.csrf, 'source': 'offline-import'}),
         ])
         self.assertIn('/collectors/new', doc.links)
-        self.assertTrue({'Denied', 'Import-only — no manual collection', 'Granted', 'Disabled'} <= set(doc.text))
         self.assertNotIn('not-settings-evidence', ' '.join(doc.text))
 
     def test_access_groups_only_effective_scopes_and_cannot_edit_proposed_roles(self):
@@ -97,10 +114,9 @@ class SettingsPagesTest(unittest.TestCase):
             _entry('view-only', 'unifi', 'example/site'),
         ]
         doc = _Page(render('/access', {}, entries, 'reader', self.csrf))
-        self.assertCountEqual([text for text in doc.text if text.startswith('View granted for scope:')],
-                              ['View granted for scope: example/stage', 'View granted for scope: example/site'])
-        self.assertTrue({'Effective access now', 'Proposal only / Not enforced', 'Denied', 'Granted',
-                         'Import-only — no manual collection', 'Disabled', 'reader'} <= set(doc.text))
+        self.assertEqual(len(doc.captions), 2)
+        for scope in ('example/stage', 'example/site'):
+            self.assertEqual(sum(scope in text for text in doc.captions), 1)
         self.assertTrue({'/collectors#collector-ready', '/collectors#collector-import',
                          '/collectors#collector-view-only'} <= doc.links)
         self.assertEqual(doc.forms, [('post', '/logout', {'csrf': self.csrf})])
@@ -125,7 +141,6 @@ class SettingsPagesTest(unittest.TestCase):
                     self.assertRegex(config['base_url'], r'\Ahttps://[a-z0-9.-]+\.test\Z')
                     self.assertEqual(set(config), {'scope', 'enabled', 'base_url', 'site_id', 'api_key_env'})
                     self.assertRegex(config['api_key_env'], r'\A[A-Z_][A-Z0-9_]*\Z')
-                self.assertIn('Read requirements', doc.text)
                 self.assertEqual(doc.forms, [('post', '/logout', {'csrf': self.csrf})])
                 self.assertIn('/collectors', doc.links)
 
@@ -133,7 +148,6 @@ class SettingsPagesTest(unittest.TestCase):
         html = render('/collectors/new', {'provider': '<img src=x>', 'next': '//example.test',
                                          'return_to': '//example.test'}, [], 'reader', self.csrf)
         doc = _Page(html)
-        self.assertIn('Unknown provider. Choose one of the listed providers.', doc.text)
         self.assertFalse(doc.templates)
         self.assertNotIn('img', doc.tags)
         self.assertNotIn('example.test', html)

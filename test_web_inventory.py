@@ -2,6 +2,7 @@
 
 from base64 import b64encode
 from hashlib import pbkdf2_hmac
+from html import unescape
 from http.client import HTTPConnection
 import json
 from pathlib import Path
@@ -138,6 +139,11 @@ class WebInventoryTests(unittest.TestCase):
         query = urlencode(dict(source=source, section=section, **filters))
         return self.workspace(f'/incus?{query}', user)
 
+    def detail_link(self, html, workspace):
+        links = {unescape(link) for link in re.findall(fr'href="({workspace}/detail\?[^"]+)"', html)}
+        self.assertEqual(len(links), 1, links)
+        return links.pop()
+
     def field(self, html, key):
         match = re.search(fr'name="{key}" value="([^"]+)"', html)
         self.assertIsNotNone(match, f'Form field not found: {key}')
@@ -166,7 +172,7 @@ class WebInventoryTests(unittest.TestCase):
                 status, headers, body = self.raw_request('GET', path)
                 self.assertEqual((status, headers['Location']), (303, '/login'))
                 self.assertNotIn('WWW-Authenticate', headers)
-                self.assertNotIn('Sources:', body)
+                self.assertEqual(body, '')
                 self.assertEqual(self.request('GET', path)[0], 200)
         credentials = b64encode(f'alice:{_PASSWORDS["alice"]}'.encode()).decode()
         self.assertEqual(self.raw_request('GET', '/', headers={'Authorization': f'Basic {credentials}'})[0], 303)
@@ -199,7 +205,10 @@ class WebInventoryTests(unittest.TestCase):
         self.assertNotIn('Secure', cookie)
         first_cookie = {'Cookie': cookie.split(';', 1)[0]}
         second_cookie = {'Cookie': self.signed_in_cookie('alice')}
-        first_csrf = self.field(self.raw_request('GET', '/', headers=first_cookie)[2], 'csrf')
+        patterns = self.raw_request('GET', '/patterns', headers=first_cookie)[2]
+        self.assertIn('action="/logout"', patterns)
+        self.assertEqual(len(re.findall(r'<h1\b', patterns)), 1)
+        first_csrf = self.field(patterns, 'csrf')
         second_csrf = self.field(self.raw_request('GET', '/', headers=second_cookie)[2], 'csrf')
         self.assertNotEqual(first_cookie, second_cookie)
         self.assertNotEqual(first_csrf, second_csrf)
@@ -321,6 +330,15 @@ class WebInventoryTests(unittest.TestCase):
         html = self.workspace('/incus?source=%73tagelight&section=instances&item=%71uery-guest')
         self.assertIn('query-guest', html)
         self.assertNotIn('other-guest', html)
+        detail = self.detail_link(html, '/incus')
+        self.assertIn('query-guest', self.workspace(detail))
+        self.assertNotIn('other-guest', self.workspace(detail))
+        self.assertEqual(self.request('GET', detail, 'bob')[0], 404)
+        status, headers, _ = self.request('GET', detail, user=None)
+        self.assertEqual((status, headers['Location']), (303, '/login'))
+        for suffix in ('&%69tem=other', '&next=%2Fcollectors'):
+            with self.subTest(suffix=suffix):
+                self.assertEqual(self.request('GET', detail + suffix)[0], 400)
         for query in ('q=%FF', 'q=%', 'q=%00', 'q=a&%71=b', 'q=' + 'x' * 257,
                       'q=' + 'x' * 2048, '&'.join(f'q{i}=x' for i in range(9))):
             with self.subTest(query=query):
@@ -377,13 +395,15 @@ class WebInventoryTests(unittest.TestCase):
         bob_csrf = self.field(self.workspace(user='bob'), 'csrf')
         for user, csrf in (('alice', alice_csrf), ('bob', bob_csrf)):
             self.assertEqual(self.post('enable', 'guest', csrf, user)[0], 303)
-        self.assertNotIn('placed-guest', self.workspace('/machines?source=guest'))
+        machine = self.detail_link(self.workspace('/machines?source=guest'), '/machines')
+        self.assertNotIn('placed-guest', self.workspace(machine))
         self.assertEqual(self.post('enable', 'stagelight', alice_csrf)[0], 303)
         self.collect('stagelight', alice_csrf)
-        target = '/incus?source=stagelight&amp;section=instances&amp;item=placed-guest'
-        self.assertIn(target, self.workspace('/machines?source=guest'))
+        target = '/incus?source=stagelight&section=instances&item=placed-guest'
+        self.assertIn(target, unescape(self.workspace(machine)))
+        self.assertIn('placed-guest', self.workspace(target))
         self.assertIn('placed-guest', self.workspace('/relationships?source=guest'))
-        for path in ('/machines?source=guest', '/relationships?source=guest'):
+        for path in (machine, '/relationships?source=guest'):
             html = self.workspace(path, 'bob')
             self.assertNotIn('placed-guest', html)
             self.assertNotIn(_STAGE, html)
@@ -402,6 +422,9 @@ class WebInventoryTests(unittest.TestCase):
         self.assertEqual(self.post('collect', 'stagelight', csrf, preview='X' * 43)[0], 403)
         self.assertEqual(self.request('GET', '/collect')[0], 404)
         preview = self.preview('stagelight', csrf)
+        self.assertIn('action="/logout"', preview)
+        self.assertEqual(len(re.findall(r'<h1\b', preview)), 1)
+        self.assertEqual(self.field(preview, 'csrf'), csrf)
         self.assertIn(_STAGE, preview)
         self.assertIn('saved &lt;operator&gt; snapshot', preview)
         self.assertNotIn(str(self.root), preview)
@@ -554,7 +577,8 @@ class WebInventoryTests(unittest.TestCase):
         self.assertEqual(self.post('enable', 'stagelight', csrf)[0], 303)
         self.assertIn('paper-moon', self.incus('comparison', status='disagreement'))
         self.assertIn('tin-piano', self.incus('comparison', status='absent'))
-        html = self.incus(item='paper-moon')
+        target = self.detail_link(self.incus(item='paper-moon'), '/incus')
+        html = self.workspace(target)
         for detail in ('x86_64', 'synthetic-node', '256MiB', '2025-01-01T09:50:00Z',
                        capture_time, '2025-01-01T10:10:00Z'):
             self.assertIn(detail, html)
@@ -569,11 +593,11 @@ class WebInventoryTests(unittest.TestCase):
                 self.assertIn('paper-moon', self.incus('comparison', status='stale'))
                 self.assertIn('tin-piano', self.incus('comparison', status='unknown'))
                 self.assertNotIn('tin-piano', self.incus('comparison', status='absent'))
-                html = self.incus()
+                html = self.workspace(target)
                 self.assertIn('synthetic-node', html)
-                self.assertIn('partial-only', html)
+                self.assertIn(f'datetime="{capture_time}"', html)
                 self.assertNotIn('obsolete-location', html)
-                self.assertIn(capture_time, html)
+                self.assertIn('partial-only', self.incus())
 
     def test_import_rejects_nonmatching_or_malformed_envelopes_without_updating_evidence(self):
         self.start()

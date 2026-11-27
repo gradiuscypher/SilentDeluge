@@ -200,7 +200,7 @@ def render(entries, query):
     return ('<section class="panel"><h2>Confirmed placement</h2>'
             + (f'<ul>{placements}</ul>' if placements else '<p>No confirmed placements in this view.</p>')
             + '</section><section class="panel"><h2>Candidate IP overlaps</h2>'
-            '<p>Contemporaneous sightings in the same configured network domain. '
-            'An overlap does not establish identity, ownership, or permission to collect.</p>'
+            '<p>A contemporaneous IP overlap in one configured network domain does not establish identity, '
+            'ownership, or permission to collect.</p>'
             + (f'<ul>{candidates}</ul>' if candidates else '<p>No candidate overlaps in this view.</p>')
             + '</section>')

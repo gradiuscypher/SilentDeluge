@@ -31,6 +31,8 @@ _ID = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}')
 _VERIFIER = re.compile(r'pbkdf2-sha256\$600000\$([0-9a-f]{32})\$([0-9a-f]{64})')
 _TOKEN = re.compile(r'[a-zA-Z0-9_-]{43}')
 _BAD_PERCENT = re.compile(r'%(?![0-9a-fA-F]{2})')
+_DETAIL_PATHS = {'/machines/detail', '/incus/detail', '/unifi/detail'}
+_DETAIL_FIELDS = {'source', 'item'}
 _COOKIE = 'silentdeluge_session'
 _SESSION_SECONDS = 8 * 60 * 60
 _SESSIONS_PER_USER = 8
@@ -507,6 +509,9 @@ class _Handler(BaseHTTPRequestHandler):
             if any(not _ID.fullmatch(key) or len(value) > 256 or (value and not value.isprintable())
                    for key, value in query.items()):
                 raise ValueError('invalid query')
+            if path in _DETAIL_PATHS and (not query.keys() <= _DETAIL_FIELDS
+                                         or ('source' in query and not _ID.fullmatch(query['source']))):
+                raise ValueError('invalid detail query')
         except ValueError:
             self._message(400, 'Invalid request target')
             return
@@ -523,10 +528,10 @@ class _Handler(BaseHTTPRequestHandler):
         if session is None:
             self._send(303, Location='/login')
             return
-        if path == '/patterns':
-            self._send(200, patterns())
-            return
         username = session.username
+        if path == '/patterns':
+            self._send(200, patterns(username, session.csrf))
+            return
         try:
             with closing(sqlite3.connect(self.server.db)) as db:
                 entries = _workspace_entries(db, username, self.server.users[username], self.server.sources)
@@ -599,9 +604,13 @@ class _Handler(BaseHTTPRequestHandler):
                 self._message(403, 'Collection not permitted')
                 return
             if self.path == '/preview':
+                from web_design import dashboard_page
+
+                csrf = session.csrf
                 token = token_urlsafe(32)
                 session.preview = (source.key, token, monotonic() + _PREVIEW_SECONDS)
-                self._send(200, _document('Preview collection', _preview(source, session.csrf, token)))
+                self._send(200, dashboard_page('/collectors', 'Preview collection',
+                                               _preview(source, csrf, token), username, csrf))
                 return
             pending = session.preview
             if (pending is None or pending[0] != source.key or pending[2] <= monotonic()

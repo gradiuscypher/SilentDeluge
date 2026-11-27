@@ -1,31 +1,40 @@
 # Inventory interface design reference
 
-Use the GRDS Pages field-guide pattern for evidence, not a marketing dashboard. The operator-side reference was reviewed from the design library's `grds-pages.md` and `grds-practice.md` specimens. The running product must not fetch that library, external fonts or private examples. `/patterns` is the local source of working examples; this note explains the design decisions.
-
-- A ruled masthead and short section labels orient the reader. Keep the primary reading track bounded; move secondary navigation above it on narrow screens.
-- Preserve a visible provenance strip beside the observations: source, scope, observation time and coverage. Status must have a text label, not just a color. Failed collection is different from a successful empty result.
-- Use the reference's neutral surface and ink contrast, blue action and restrained contrasting detail, thin rules, monospace labels and visible keyboard focus. Don't reuse brand text or copy a landing-page hero into a dense inventory view.
-- Exercise the actual shared styles at phone and desktop widths. Synthetic samples in the pattern library should include complete, partial, stale, disconnected and error states; never use a real capture as a design fixture.
+SilentDeluge is a working inventory, not a landing page. Give the results
+the widest track, with clear headings, lightweight rules, and visible state and
+provenance. `/patterns` uses the production shell and local components with
+synthetic evidence. The product fetches no design-library code, fonts or assets.
 
 ## Compact workspace
 
-- **Orient without duplicating links.** The shared shell provides the masthead and
-  skip link; the workspace owns one named `.workspace-nav`, including the link
-  to `/patterns`. The reference has its own in-page jumps and a way back to the
-  overview. Following [GOV.UK service navigation](https://design-system.service.gov.uk/components/service-navigation/),
-  mark the current workspace page with `aria-current="page"` and a visible
-  change beyond color. Let the list wrap rather than hide destinations.
+- **One workspace navigation.** [Carbon UI shell left panel](https://www.carbondesignsystem.com/building-blocks/core/components/ui-shell-left-panel/guidelines)
+  provides a model for frequently switched sections. Put the brand, icon and text
+  links, signed-in account and logout together in the left sidebar; do not
+  repeat them in a desktop masthead. Mark the active link with a left rule and
+  stronger text as well as color. `aria-current="page"` marks an exact match;
+  `aria-current="location"` marks the parent of a nested route. Reflow the same
+  links into a short grid on narrow screens; no separate menu or hidden destinations.
+  The sign-in and message shell has a narrow reading track and no workspace menu.
+- **Use width for data.** The primary track expands to about 1,800 CSS pixels.
+  [GitHub Primer DataTable](https://primer.style/product/components/data-table/)
+  pairs a descriptive title with a named, scannable table and row headers for
+  item identity. [Carbon Data table](https://www.carbondesignsystem.com/building-blocks/core/components/data-table/guidelines)
+  gives dense tables room in the main area, with a toolbar before the rows
+  and pagination after them. Use the references as patterns, not dependencies.
 - **Compare rows before opening details.** The [W3C WAI tables tutorial](https://www.w3.org/WAI/tutorials/tables/)
   calls for captions and explicit header associations. Inventory tables keep a
   caption, `scope="col"` on column headers and `scope="row"` on record names;
-  show state, scope and time in compact cells. Do not replace a table with a
-  set of unrelated cards, hide columns on narrow screens, or dump raw JSON.
-- **Keep filters and counts together.** The [USWDS search guidance](https://designsystem.digital.gov/components/search/#guidance)
-  recommends labeled inputs, keeping search terms in the result view, and a
-  native submit button. Workspace filters use a `.toolbar` and a GET `.filters`
-  form; label each field, keep active values, and give search room where space
-  allows. Place a `.summary` before the results: say what is shown, the total
-  matching count when known, or that there are no matches and how to reset.
+  show state, scope and time in compact cells. Render only the list fields and
+  intentionally short previews in the list, not the full payload. A preview
+  can wrap to two visual lines; link to the complete record by name or with a
+  row-specific label, on a focusable link outside the clamp. Do not replace a
+  table with cards, remove mobile columns, or put detail-only fields in hidden markup.
+- **Keep filters and counts together.** Following Carbon's toolbar placement and
+  [USWDS search guidance](https://designsystem.digital.gov/components/search/#guidance),
+  put a labeled GET form above the results. Keep labels beside their fields
+  in one desktop row; wrap field pairs on small screens. Retain active values
+  and use a real submit button and reset link. Place a `.summary` before the
+  results with the visible range and total, or a clear empty state and reset.
   An empty filtered result is not evidence that an asset is absent.
 - **Page only when needed.** [GOV.UK pagination](https://design-system.service.gov.uk/components/pagination/)
   places the pager after the results, omits it for a single page, and drops
@@ -48,6 +57,7 @@ Use the GRDS Pages field-guide pattern for evidence, not a marketing dashboard. 
   Compact navigation still provides at least 24 × 24 CSS pixel link targets,
   following [WCAG Target Size (Minimum)](https://www.w3.org/WAI/WCAG22/Understanding/target-size-minimum.html).
 
-`/patterns` uses only fixed synthetic fixtures. The scope selector and pager
-show local states via CSS, with no scripts, private resources, or request-time
-inventory. Workspace filtering and paging use ordinary query links and forms.
+`/patterns` reads no inventory. Its scope selector filters only the synthetic
+comparison rows and its example pager uses local fragment links. Full evidence
+targets work without CSS. Production filtering and paging use ordinary GET
+forms and query links; detail-only fields are rendered in the detail view.

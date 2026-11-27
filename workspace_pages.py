@@ -3,11 +3,14 @@
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
+from hashlib import sha256
 from html import escape
+from json import dumps
+import re
 from urllib.parse import urlencode
 
 from inventory import compare
-from web_design import page, status_badge
+from web_design import status_badge
 
 
 _WORKSPACES = {
@@ -17,33 +20,28 @@ _WORKSPACES = {
 }
 _PATHS = {provider: path for path, (provider, _, _) in _WORKSPACES.items()}
 _SETTINGS = {'/collectors', '/collectors/new', '/access'}
-_NAV = (
-    ('/', 'Overview'), ('/machines', 'Machines'), ('/incus', 'Incus'), ('/unifi', 'UniFi'),
-    ('/relationships', 'Relationships'), ('/collectors', 'Collectors'), ('/access', 'Access'),
-    ('/patterns', 'Design patterns'),
-)
 _SECTIONS = {
     'linux': {
-        'system': ('System', 'Operating system, kernel, architecture, and boot information.'),
-        'packages': ('Installed packages', 'Packages recorded by the selected package manager.'),
-        'services': ('Services', 'Service definitions or started services, as reported by the selected manager.'),
+        'system': ('System', ''),
+        'packages': ('Installed packages', ''),
+        'services': ('Services', 'Service coverage depends on the reporting manager.'),
         'cpu': ('CPU usage', 'Sampled usage in the reported accounting view, not CPU capacity.'),
         'addresses': ('Network addresses', 'Addresses observed in the machine network namespace.'),
         'memory': ('Memory', 'Usage and capacity in the reported accounting view.'),
         'disk': ('Root filesystem', 'Space usage for the root filesystem, not all guest storage.'),
         'storage': ('Scoped storage', 'Usage at selected mount points, not all guest storage.'),
-        'users': ('Local accounts', 'Local user names, UIDs, and primary GIDs.'),
-        'interfaces': ('Network interfaces', 'Names and indices in the observed network namespace.'),
-        'network_links': ('Network links', 'Operational state, MTU, and counters in the observed namespace.'),
+        'users': ('Local accounts', ''),
+        'interfaces': ('Network interfaces', 'Interfaces in the observed network namespace.'),
+        'network_links': ('Network links', 'Counters in the observed network namespace.'),
     },
     'incus': {
-        'instances': ('Incus instances', 'Instance state, effective limits, and provider context.'),
+        'instances': ('Incus instances', ''),
         'runtime': ('Runtime sightings', 'Runtime sightings do not cover the instance inventory.'),
         'guest_addresses': ('Guest addresses', 'Address sightings do not establish absence.'),
         'comparison': ('Declaration comparison', 'Only a current complete instance capture can establish absence.'),
     },
     'unifi': {
-        'managed_devices': ('Managed devices', 'Devices reported as managed by this site.'),
+        'managed_devices': ('Managed devices', ''),
         'connected_clients': ('Connected clients', 'A client not listed here may be disconnected; absence is not established.'),
     },
 }
@@ -77,7 +75,12 @@ _IDENTITY_HEADERS = {
 
 
 def _e(value):
-    return escape(str(value), quote=True)
+    return escape(_html_text(value), quote=True)
+
+
+def _html_text(value):
+    # JSON strings can contain isolated surrogate escapes; HTML must be UTF-8.
+    return str(value).encode('utf-8', errors='replace').decode('utf-8')
 
 
 def _url(path, **params):
@@ -94,15 +97,9 @@ def _time(value):
 
 
 def _document(path, title, body, username, csrf):
-    links = ''.join(f'<a href="{url}"' + (' aria-current="page"' if url == path else '') + f'>{label}</a>'
-                    for url, label in _NAV)
-    return page(title, '<div class="patterns stack"><header class="report-header stack">'
-                f'<nav class="section-nav" aria-label="Workspaces">{links}</nav>'
-                f'<p>Signed in as <strong>{_e(username)}</strong>.</p>'
-                '<form method="post" action="/logout">'
-                f'<input type="hidden" name="csrf" value="{_e(csrf)}">'
-                '<button type="submit">Log out</button></form>'
-                f'<h1>{_e(title)}</h1></header>{body}</div>')
+    from web_design import dashboard_page
+
+    return dashboard_page(path, title, body, username, csrf)
 
 
 def _enabled(entries):
@@ -115,7 +112,7 @@ def _latest(timestamps):
 
 def _overview(entries):
     cards = []
-    for path, (provider, title, description) in _WORKSPACES.items():
+    for path, (provider, title, _) in _WORKSPACES.items():
         counts = Counter()
         attempts, captures = [], []
         for entry in entries:
@@ -142,7 +139,7 @@ def _overview(entries):
                 else:
                     counts['not_current'] += 1
         attempt, capture = _latest(attempts), _latest(captures)
-        cards.append(f'<section class="panel"><h2>{_link(path, title)}</h2><p>{description}</p>'
+        cards.append(f'<section class="panel"><h2>{_link(path, title)}</h2>'
                      f'<p>Sources: {counts["sources"]} · Disabled: {counts["disabled"]} · '
                      f'Enabled without an attempt: {counts["without_attempt"]}</p>'
                      f'<p>Sections: {counts["complete"]} complete · {counts["partial"]} partial · '
@@ -150,8 +147,7 @@ def _overview(entries):
                      '<p>Latest processed attempt: ' + (_time(attempt) if attempt else 'None') + '</p>'
                      '<p>Newest retained capture: ' + (_time(capture) if capture else 'None') + '</p></section>')
     empty = '<p>No sources are available in your scopes.</p>' if not entries else ''
-    return (f'<p class="lede">Inventory counts and freshness for your approved sources.</p>{empty}'
-            '<div class="panel-grid">' + ''.join(cards) + '</div>')
+    return empty + '<div class="panel-grid">' + ''.join(cards) + '</div>'
 
 
 def render(path, query, entries, username, csrf):
@@ -172,8 +168,13 @@ def render(path, query, entries, username, csrf):
             link = '<p>' + _link(_url(target, source=entry['id']), 'Browse source inventory') + '</p>'
         body = link + asset_relations.render(entries, query)
     elif path in _WORKSPACES:
-        _, title, description = _WORKSPACES[path]
-        body = f'<p class="lede">{description}</p>' + _inventory(path, query, _enabled(entries))
+        _, title, _ = _WORKSPACES[path]
+        body = _inventory(path, query, _enabled(entries))
+    elif path.endswith('/detail') and (workspace := path.removesuffix('/detail')) in _WORKSPACES:
+        detail = _detail(workspace, query, _enabled(entries))
+        if detail is None:
+            return None
+        title, body = detail
     else:
         return None
     return _document(path, title, body, username, csrf)
@@ -299,6 +300,7 @@ class _Section:
 class _Row:
     section: _Section
     basis: str
+    index: int
     status: str
     title: str
     item: str
@@ -321,7 +323,7 @@ def _comparison(section):
         ]
         scans.append(dict(source=entry['id'], scope=entry['scope'], timestamp=complete['timestamp'],
                           outcome='complete', instances=instances))
-    for result in compare(entry['declarations'], scans):
+    for index, result in enumerate(compare(entry['declarations'], scans)):
         status = result['status'].replace(' ', '-')
         # A later incomplete, omitted, or replayed section cannot establish absence.
         if entry['state'] is not None and section.outcome != 'complete':
@@ -331,7 +333,17 @@ def _comparison(section):
             'Observed': result['observed'],
             'Differing fields': [_label(field) for field in result['differences']],
         }
-        yield _Row(section, 'comparison', status, result['name'], result['name'], fields)
+        yield _Row(section, 'comparison', index, status, result['name'], result['name'], fields)
+
+
+def _record_row(section, basis, index, record):
+    key = next((key for key in ('name', 'path', 'view', 'asset', 'mac_address', 'ip_address', 'id')
+                if isinstance(record.get(key), str) and record[key]), None)
+    title = record[key] if key else 'Observation'
+    item = record.get('id') if section.entry['provider'] == 'unifi' else None
+    current = section.outcome == 'complete' if basis == 'complete' else section.current_partial
+    return _Row(section, basis, index, basis if current else 'stale', title,
+                item if isinstance(item, str) and item else title, record)
 
 
 def _rows(section):
@@ -340,17 +352,67 @@ def _rows(section):
             yield from _comparison(section)
         return
 
-    for basis, capture, current in (('complete', section.complete, section.outcome == 'complete'),
-                                    ('partial', section.partial, section.current_partial)):
-        if not capture:
-            continue
-        for record in capture['records']:
-            key = next((key for key in ('name', 'path', 'view', 'asset', 'mac_address', 'ip_address', 'id')
-                        if isinstance(record.get(key), str) and record[key]), None)
-            title = record[key] if key else 'Observation'
-            item = record.get('id') if section.entry['provider'] == 'unifi' else None
-            yield _Row(section, basis, basis if current else 'stale', title,
-                       item if isinstance(item, str) and item else title, record)
+    for basis, capture in (('complete', section.complete), ('partial', section.partial)):
+        if capture:
+            for index, record in enumerate(capture['records']):
+                yield _record_row(section, basis, index, record)
+
+
+def _digest(value):
+    return sha256(dumps(value, sort_keys=True, separators=(',', ':')).encode('ascii')).hexdigest()
+
+
+def _section_param(name):
+    # Provider extensions need not fit the HTTP query-value limit.
+    if (name == 'overview' or name.startswith('@') or not name.isprintable()
+            or len(urlencode({'section': name})) > 264):
+        return '@' + _digest(name)
+    return name
+
+
+def _source_identity(entry):
+    return entry['id'], entry['provider'], entry['scope']
+
+
+def _record_digest(row):
+    entry = row.section.entry
+    declaration = entry['declarations'] if row.basis == 'comparison' else None
+    return _digest((_source_identity(entry), row.section.name, row.basis, row.index,
+                    row.capture['timestamp'] if row.capture else None, row.record,
+                    (declaration['source'], declaration['timestamp']) if declaration else None))
+
+
+def _record_url(path, row):
+    # A capture-local index distinguishes identical observations. Verify the digest
+    # before displaying anything: an index, name, or provider ID alone can be reused.
+    item = f'{_digest(row.section.name)}.{row.basis}.{row.index}.{_record_digest(row)}'
+    return _url(f'{path}/detail', source=row.section.entry['id'], item=item)
+
+
+_RECORD_ITEM = re.compile(r'([0-9a-f]{64})\.(complete|partial|comparison)\.(0|[1-9][0-9]{0,15})\.([0-9a-f]{64})')
+
+
+def _find_record(entry, item):
+    if not (match := _RECORD_ITEM.fullmatch(item)):
+        return None
+    section_key, basis, index, digest = match.groups()
+    names = [name for name in _section_names(entry) if _digest(name) == section_key]
+    if len(names) != 1:
+        return None
+    section = _Section.from_entry(entry, names[0])
+    index = int(index)
+    if entry['provider'] == 'incus' and section.name == 'comparison':
+        if basis != 'comparison':
+            return None
+        row = next((row for row in _comparison(section) if row.index == index), None)
+    elif basis == 'comparison':
+        return None
+    else:
+        capture = section.complete if basis == 'complete' else section.partial
+        if not capture or index >= len(capture['records']):
+            return None
+        row = _record_row(section, basis, index, capture['records'][index])
+    return row if row is not None and _record_digest(row) == digest else None
 
 
 def _attempt(entry):
@@ -362,10 +424,9 @@ def _attempt(entry):
     return f'<p>{label}: {_e(state["outcome"])} — {_time(state["timestamp"])}.</p>'
 
 
-def _section_summary(section):
+def _section_context(section, description):
     entry = section.entry
-    title, description = _section_info(entry['provider'], section.name)
-    body = f'<p>Scope: {_e(entry["scope"])}</p>'
+    body = f'<p>Source: {_e(entry["id"])} · Scope: {_e(entry["scope"])}</p>'
     if description:
         body += f'<p>{_e(description)}</p>'
     if entry['provider'] == 'incus' and section.name == 'comparison':
@@ -387,13 +448,19 @@ def _section_summary(section):
         body += '<p>No sightings in this partial capture (0 records).</p>'
     if not section.complete and not section.partial and section.outcome == 'failed':
         body += '<p>No retained capture.</p>'
+    return body
+
+
+def _section_summary(section):
+    entry = section.entry
+    title, _ = _section_info(entry['provider'], section.name)
     source = entry['id']
     links = [_link(_url(_PATHS[entry['provider']], source=source), 'Browse source'),
              _link(_url('/relationships', source=source), 'Source relationships')]
     if entry['declarations'] is not None and section.name != 'comparison':
         links.append(_link(_url('/incus', source=source, section='comparison'), 'Declaration comparison'))
     return _disclose(f'{source} — {title} ({_COVERAGE[section.status]})',
-                     body + _detail_links(links, 'Source context'))
+                     _section_context(section, '') + _detail_links(links, 'Source context'))
 
 
 def _related(enabled):
@@ -448,36 +515,94 @@ def _result_table(caption, headings, rows):
             + '</tbody></table></div>')
 
 
+def _short(value):
+    text = ' '.join(str(value).split())
+    return text if len(text) <= 48 else text[:47].rstrip() + '…'
+
+
+def _cell(line, second=None):
+    markup = f'<div class="cell-summary">{line}</div>'
+    return markup if second is None else markup + f'<div class="cell-summary">{second}</div>'
+
+
 def _field_cell(record, field):
+    if field not in record:
+        return _cell('—')
+    value = record[field]
     if field == 'Differing fields':
-        return _e(', '.join(record[field]) or 'None')
-    # Unreported keys are not the same as explicit nulls (e.g. an uncapped limit).
-    value = record.get(field)
-    if field not in record or isinstance(value, (dict, list)):
-        return '—'
-    return _value(value, field)
+        return _cell(_e(value[0]) if value else 'None',
+                     f'<small>+{len(value) - 1} more</small>' if len(value) > 1 else None)
+    if isinstance(value, (dict, list)):
+        count = len(value)
+        noun = 'field' if isinstance(value, dict) else 'item'
+        return _cell(f'{count} {noun}{"s" if count != 1 else ""}')
+    if type(value) in (str, int, float) and value != '':
+        shortened = _short(value)
+        if shortened != str(value):
+            return _cell(_e(shortened or 'Whitespace'))
+    return _cell(_value(value, field))
 
 
-def _row_cells(path, row, related, fields):
+def _row_badge(row):
+    return _badge(row.status, _COMPARISON if row.basis == 'comparison' else _COVERAGE)
+
+
+def _row_cells(path, row, fields):
     entry, name = row.section.entry, row.section.name
     source = entry['id']
-    record = row.record
-    identity = _link(_url(path, source=source, section=name, item=row.item), row.title)
-    basis = _badge(row.status, _COMPARISON if row.basis == 'comparison' else _COVERAGE)
-    if row.basis == 'partial' and row.status == 'stale':
-        basis += '<br><small>Retained partial sighting</small>'
-    context = _link(_url(path, source=source, section=name), source)
-    context += f'<br><small>{_e(entry["scope"])}</small>'
-    cells = [_field_cell(record, field) for field in fields]
-    extra = {key: value for key, value in record.items()
-             if key not in fields and not (key in ('name', 'path', 'view', 'asset', 'ip_address', 'mac_address')
-                                           and value == row.title)}
-    detail = _value(extra) if extra else ''
-    detail += _detail_links(_placement_links(entry, row.item, related), 'Placement')
-    if row.basis == 'comparison' and row.status in ('unknown', 'stale'):
-        detail += '<p>The latest attempt did not verify current presence or absence.</p>'
-    return (identity, *cells, basis, context, _time(row.capture['timestamp']) if row.capture else '—',
-            _disclose(f'Details for {row.title}', detail))
+    identity = _cell(_link(_record_url(path, row), _short(row.title) or 'Observation'))
+    retained = '<small>Retained partial</small>' if row.basis == 'partial' and row.status == 'stale' else None
+    context = _cell(_link(_url(path, source=source, section=_section_param(name)), _short(source)),
+                    f'<small>{_e(_short(entry["scope"]))}</small>')
+    captured = _time(row.capture['timestamp']) if row.capture else '—'
+    return (identity, *(_field_cell(row.record, field) for field in fields),
+            _cell(_row_badge(row), retained), context, _cell(captured))
+
+
+def _detail(path, query, enabled):
+    if query.keys() != {'source', 'item'}:
+        return None
+    entry = enabled.get(query['source'])
+    if not entry or entry['provider'] != _WORKSPACES[path][0]:
+        return None
+    item = query['item']
+    if path == '/machines' and item == _machine_item(entry):
+        sections = _machine_sections(entry)
+        links = [_link(_url(path, source=entry['id']), 'Back to machine overview')]
+        links += _machine_links(entry, sections, _related(enabled))
+        context = f'<p>Source: {_e(entry["id"])} · Scope: {_e(entry["scope"])}</p>' + _attempt(entry)
+        if sections:
+            context += ('<h2>Section coverage</h2>'
+                        + ''.join(_section_summary(section) for section in sections.values()))
+        else:
+            context += '<p>No inventory sections received.</p>'
+        return entry['id'], _detail_links(links, 'Machine evidence') + f'<article class="panel">{context}</article>'
+
+    if (row := _find_record(entry, item)) is None:
+        return None
+    section = row.section
+    source = entry['id']
+    title, description = _section_info(entry['provider'], section.name)
+    links = [_link(_url(path, source=source, section=_section_param(section.name)), f'Back to {title}'),
+             _link(_url('/relationships', source=source), 'Source relationships')]
+    links += _placement_links(entry, row.item, _related(enabled))
+    if entry['declarations'] is not None and section.name != 'comparison':
+        links.append(_link(_url(path, source=source, section='comparison'), 'Declaration comparison'))
+    if row.basis == 'comparison':
+        basis = 'Complete instance capture' if row.capture else 'No complete instance capture'
+    elif row.basis == 'partial':
+        basis = 'Retained partial sighting' if row.status == 'stale' else 'Partial sighting'
+    else:
+        basis = 'Last verified complete capture' if row.status == 'stale' else 'Complete capture'
+    captured = ' — ' + _time(row.capture['timestamp']) if row.capture else ''
+    note = ('<p>The latest attempt did not verify current presence or absence.</p>'
+            if row.basis == 'comparison' and row.status in ('stale', 'unknown') else '')
+    body = (_detail_links(links, 'Record context')
+            + f'<article class="record-detail panel"><h2>{_e(title)}</h2>'
+              f'<p>{_row_badge(row)} {basis}{captured}</p>{note}'
+              f'{_section_context(section, description)}'
+              f'<h2>Record fields</h2>{_value(row.record)}</article>')
+    return _html_text(row.title) if row.title.strip() else 'Observation', body
 
 
 def _matches(tokens, *values):
@@ -501,19 +626,21 @@ def _machine_statuses(entry, sections):
 
 def _sample(section):
     if not section:
-        return {}, ''
+        return None
     # Prefer the current capture; only fall back to an older retained value.
-    captures = ((section.complete, 'complete' if section.outcome == 'complete' else 'stale'),
-                (section.partial, 'partial' if section.current_partial else 'stale'))
-    available = [(capture, status) for capture, status in captures if capture and capture['records']]
+    captures = ((section.complete, 'complete', section.outcome == 'complete'),
+                (section.partial, 'partial', bool(section.current_partial)))
+    available = [(capture, basis, current) for capture, basis, current in captures
+                 if capture and capture['records']]
     if not available:
-        return {}, ''
-    capture, status = max(available, key=lambda pair: (pair[1] != 'stale',
-                                                      datetime.fromisoformat(pair[0]['timestamp'])))
-    return capture['records'][0], status
+        return None
+    capture, basis, _ = max(available, key=lambda pair: (pair[2], datetime.fromisoformat(pair[0]['timestamp'])))
+    return _record_row(section, basis, 0, capture['records'][0])
 
 
 def _size(value):
+    if not 0 <= value < 1024**6:
+        return f'{_short(value)} B'
     for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'):
         if value < 1024 or unit == 'PiB':
             return f'{value:.3g} {unit}'
@@ -530,33 +657,48 @@ def _machine_rows(sources, status, item, tokens):
             continue
         samples = {name: _sample(sections.get(name)) for name in ('system', 'cpu', 'memory')}
         if tokens:
-            assets = (record['asset'] for section in sections.values()
-                      if (record := _sample(section)[0]) and isinstance(record.get('asset'), str))
-            facts = (value for record, _ in samples.values() for value in _search_values(record))
+            assets = (sample.record['asset'] for section in sections.values()
+                      if (sample := _sample(section)) and isinstance(sample.record.get('asset'), str))
+            facts = (value for sample in samples.values() if sample for value in _search_values(sample.record))
             if not _matches(tokens, entry['id'], entry['scope'], *assets, *facts):
                 continue
         yield entry, sections, counts, samples
 
 
-def _machine_cells(machine, related):
-    entry, sections, counts, samples = machine
+def _machine_item(entry):
+    return 'machine.' + _digest(_source_identity(entry))
+
+
+def _machine_links(entry, sections, related):
     source = entry['id']
-    system, system_status = samples['system']
-    cpu, cpu_status = samples['cpu']
-    memory, memory_status = samples['memory']
+    links = [_link(_url('/machines', source=source, section=_section_param(name)), _section_info('linux', name)[0])
+             for name in sections]
+    links.append(_link(_url('/relationships', source=source), 'Source relationships'))
+    return links + _placement_links(entry, '', related)
 
-    def field(value, name, basis):
-        if not value:
-            return '—'
-        cell = _link(_url('/machines', source=source, section=name), value)
-        return cell + (f'<br>{_badge(basis)}' if basis != 'complete' else '')
 
-    os_release = ' '.join(str(system[key]) for key in ('os_id', 'os_version') if system.get(key))
+def _machine_cells(machine):
+    entry, _, counts, samples = machine
+    source = entry['id']
+    system, cpu, memory = (samples[name].record if samples[name] else {} for name in ('system', 'cpu', 'memory'))
+
+    def field(value, name):
+        sample = samples[name]
+        if not value or sample is None:
+            return _cell('—')
+        if isinstance(value, (dict, list)):
+            value = 'Structured value'
+        status = _badge(sample.status) if sample.status != 'complete' else None
+        return _cell(_link(_record_url('/machines', sample), _short(value)), status)
+
+    os_release = ' '.join(str(system[key]) for key in ('os_id', 'os_version')
+                          if system.get(key) and isinstance(system[key], (str, int, float)))
     cpu_value = ''
-    if type(cpu.get('busy_percent')) in (float, int):
-        cpu_value = f'{cpu["busy_percent"]:.3g}%'
-    elif type(cpu.get('cpu_cores_used')) in (float, int):
-        cpu_value = f'{cpu["cpu_cores_used"]:.3g} cores'
+    for key, units in (('busy_percent', '%'), ('cpu_cores_used', ' cores')):
+        number = cpu.get(key)
+        if type(number) in (float, int):
+            cpu_value = (f'{number:.3g}' if type(number) is float else _short(number)) + units
+            break
     memory_value = ''
     if type(memory.get('used_bytes')) is int:
         memory_value = _size(memory['used_bytes'])
@@ -565,26 +707,19 @@ def _machine_cells(machine, related):
             memory_value += ' / ' + _size(capacity)
         elif 'limit_bytes' in memory and capacity is None:
             memory_value += ' / uncapped'
-    drilldown = 'system' if 'system' in sections else next(iter(sections), '')
-    links = [_link(_url('/machines', source=source, section=name), _section_info('linux', name)[0])
-             for name in sections]
-    links += [_link(_url('/relationships', source=source), 'Source relationships')]
-    links += _placement_links(entry, '', related)
-    detail = _attempt(entry)
-    if not sections:
-        detail += '<p>No inventory sections received. Review the machine source in Collectors.</p>'
-    evidence = ' '.join(f'{_badge(key)}{f" × {count}" if count > 1 else ""}'
-                        for key in _COVERAGE if (count := counts[key]))
-    return (_link(_url('/machines', source=source, section=drilldown), source),
-            _e(entry['scope']), field(os_release, 'system', system_status),
-            field(system.get('kernel_release'), 'system', system_status),
-            field(cpu_value, 'cpu', cpu_status), field(memory_value, 'memory', memory_status),
-            evidence, _time(entry['state']['timestamp']) if entry['state'] else '—',
-            _disclose(f'Evidence sections for {source}', detail + _detail_links(links, 'Machine evidence')))
+    primary = next(key for key in ('failed', 'stale', 'partial', 'unknown', 'not-connected', 'complete') if counts[key])
+    other = sum(bool(count) for key, count in counts.items() if key != primary)
+    evidence = _cell(_badge(primary), f'<small>+{other} other {"status" if other == 1 else "statuses"}</small>'
+                     if other else None)
+    attempt = _time(entry['state']['timestamp']) if entry['state'] else '—'
+    return (_cell(_link(_url('/machines/detail', source=source, item=_machine_item(entry)), _short(source))),
+            _cell(_e(_short(entry['scope']))), field(os_release, 'system'),
+            field(system.get('kernel_release'), 'system'), field(cpu_value, 'cpu'), field(memory_value, 'memory'),
+            evidence, _cell(attempt))
 
 
 _MACHINE_HEADINGS = ('Machine', 'Scope', 'OS', 'Kernel', 'CPU usage', 'Memory used',
-                     'Evidence', 'Latest attempt', 'Drilldown')
+                     'Evidence', 'Latest attempt')
 
 
 def _section_links(path, provider, sections, active, params):
@@ -594,24 +729,23 @@ def _section_links(path, provider, sections, active, params):
     links = []
     for name, label in sections.items():
         current = ' aria-current="page"' if name == active else ''
-        links.append(f'<a href="{_e(_url(path, **common, section=name))}"{current}>{_e(label)}</a>')
+        links.append(f'<a href="{_e(_url(path, **common, section=name))}"{current}>{_e(_short(label))}</a>')
     return f'<nav class="section-nav" aria-label="Inventory sections">{"".join(links)}</nav>'
 
 
-def _empty_inventory(sources, source, section, sections, filtered):
+def _empty_inventory(provider, sources, source, section, sections, filtered):
     if not sources:
         if source:
-            return '<p>No matching source. Choose an enabled source or clear filters.</p>'
+            return '<p>No matching enabled source.</p>'
         return ('<p>No enabled sources in this workspace. '
                 'Enable an approved view in <a href="/collectors">Collectors</a>.</p>')
     if section not in sections:
-        if section == 'comparison':
-            return '<p>No declarations configured for these enabled sources. Choose Incus instances to browse observations.</p>'
-        return '<p>Section unavailable. Choose an inventory section or clear filters.</p>'
+        if provider == 'incus' and section == 'comparison':
+            return '<p>No declarations configured for these enabled sources.</p>'
+        return '<p>Section unavailable.</p>'
     if filtered:
-        return '<p>No matching records. Clear filters to browse available evidence; no matches do not establish absence.</p>'
-    return ('<p>No records to display. Check source and section coverage below, choose another section, '
-            'or review collection in <a href="/collectors">Collectors</a>.</p>')
+        return '<p>No matching records. The filter does not establish absence.</p>'
+    return '<p>No records to display. Check source and section coverage.</p>'
 
 
 def _select(name, label, choices, current):
@@ -622,18 +756,17 @@ def _select(name, label, choices, current):
 
 def _filters(path, sources, sections, statuses, params):
     source_choices = [('', 'All enabled sources')] + [(entry['id'], entry['id']) for entry in sources]
-    section_choices = list(sections.items())
+    section_choices = [(key, _short(label)) for key, label in sections.items()]
     status_choices = [('', 'Any status')] + list(statuses.items())
     item = (f'<input type="hidden" name="item" value="{_e(params["item"])}">' if params.get('item') else '')
-    return (f'<form method="get" action="{path}" class="toolbar filters" aria-label="Filter inventory">'
-            f'<label>Search inventory <input type="search" name="q" value="{_e(params.get("q", ""))}"></label>'
-            f'<div class="section-nav">{item}'
+    return (f'<form method="get" action="{path}" class="report-header toolbar filters" aria-label="Filter inventory">'
+            f'{item}<label>Search <input type="search" name="q" value="{_e(params.get("q", ""))}"></label>'
             f'{_select("source", "Source", source_choices, params.get("source", ""))}'
             f'{_select("section", "Section", section_choices, params.get("section", ""))}'
             f'{_select("status", "Status", status_choices, params.get("status", ""))}'
-            f'{_select("per_page", "Results per page", [("25", "25"), ("50", "50")], params.get("per_page", "25"))}'
-            '</div><div class="section-nav"><button type="submit">Search</button>'
-            f'{_link(path, "Clear filters")}</div></form>')
+            f'{_select("per_page", "Per page", [("25", "25"), ("50", "50")], params.get("per_page", "25"))}'
+            '<button type="submit">Apply</button>'
+            f'{_link(path, "Clear filters")}</form>')
 
 
 def _paginate(path, items, per_page, raw_page, params):
@@ -659,7 +792,7 @@ def _paginate(path, items, per_page, raw_page, params):
 def _matching_rows(provider, sections, status, item, tokens):
     for section in sections:
         title, _ = _section_info(provider, section.name)
-        coverage = _COMPARISON if section.name == 'comparison' else _COVERAGE
+        coverage = _COMPARISON if provider == 'incus' and section.name == 'comparison' else _COVERAGE
         for row in _rows(section):
             if item and item != row.item:
                 continue
@@ -686,11 +819,11 @@ def _inventory(path, query, enabled):
     sources = [entry for entry in all_sources if not source or entry['id'] == source]
     q = query.get('q', '').strip()
     default = _DEFAULT_SECTIONS[provider]
-    section = query.get('section') or default
+    section_key = query.get('section') or default
     # Relationship drilldowns pass the canonical UniFi client ID as a search term.
     if provider == 'unifi' and source and not query.get('section') and q.startswith('unifi:'):
         if ':connected_clients:' in q:
-            section = 'connected_clients'
+            section_key = 'connected_clients'
     item = query.get('item', '')
     status = _state_key(query.get('status', ''))
     per_page = 50 if query.get('per_page') == '50' else 25
@@ -698,29 +831,34 @@ def _inventory(path, query, enabled):
     names = set(_SECTIONS[provider]) - {'comparison'}
     for entry in sources:
         names.update(_section_names(entry))
-    sections = {default: 'Machine overview' if provider == 'linux' else _section_info(provider, default)[0]}
-    sections.update((name, _section_info(provider, name)[0]) for name in sorted(names - {default}))
+    if provider != 'linux':
+        names.discard(default)
+    section_names = {default: default}
+    section_names.update((_section_param(name), name) for name in sorted(names))
+    sections = {key: 'Machine overview' if provider == 'linux' and key == default else _section_info(provider, name)[0]
+                for key, name in section_names.items()}
+    section = section_names.get(section_key, section_key)
     if source and sources:
         params['source'] = source
-    if section in sections:
-        params['section'] = section
+    if section_key in sections:
+        params['section'] = section_key
     if q and sources:
         params['q'] = q
 
-    machines = provider == 'linux' and section == default
-    statuses = dict(_COMPARISON if section == 'comparison' else _COVERAGE)
-    if not machines and section != 'comparison':
+    machines = provider == 'linux' and section_key == default
+    comparison = provider == 'incus' and section == 'comparison'
+    statuses = dict(_COMPARISON if comparison else _COVERAGE)
+    if not machines and not comparison:
         statuses.update((_state_key(state), f'Reported state: {state}')
                         for state in _REPORTED_STATES[provider])
-    related = _related(enabled)
     tokens = q.casefold().split()
     evidence = ''
     observed = []
     if machines:
         rows = list(_machine_rows(sources, status, item, tokens))
-    elif section in sections:
+    elif section_key in sections:
         observed = [_Section.from_entry(entry, section) for entry in sources
-                    if section != 'comparison' or entry['declarations'] is not None]
+                    if not comparison or entry['declarations'] is not None]
         rows = list(_matching_rows(provider, observed, status, item, tokens))
         rows.sort(key=lambda row: (row.title.casefold(), row.title, row.section.entry['id'], row.basis, row.item))
         if status and status not in statuses and rows:
@@ -734,24 +872,29 @@ def _inventory(path, query, enabled):
         params['item'] = item
     visible, count, pagination = _paginate(path, rows, per_page, query.get('page', ''), params)
 
-    caption, description = _section_info(provider, section) if section in sections else (sections[default], '')
+    caption, description = _section_info(provider, section) if section_key in sections else (sections[default], '')
     if machines:
-        table = _result_table('Machine overview', _MACHINE_HEADINGS,
-                              (_machine_cells(machine, related) for machine in visible))
+        table = _result_table('Machine overview', _MACHINE_HEADINGS, map(_machine_cells, visible))
+        if source and visible:
+            entry, machine_sections, _, _ = visible[0]
+            evidence = _detail_links(_machine_links(entry, machine_sections, _related(enabled)), 'Machine evidence')
     else:
         fields = _TABLE_FIELDS.get((provider, section), ())
         identity = _IDENTITY_HEADERS.get((provider, section), 'Observation')
-        headings = (identity, *map(_label, fields), 'Evidence', 'Source and scope', 'Capture time', 'Details')
-        table = _result_table(caption, headings, (_row_cells(path, row, related, fields) for row in visible))
+        headings = (identity, *map(_label, fields), 'Evidence', 'Source and scope', 'Capture time')
+        table = _result_table(caption, headings, (_row_cells(path, row, fields) for row in visible))
         shown = {row.section.entry['id'] for row in visible}
+        if item and visible and source and provider == 'incus':
+            links = _placement_links(visible[0].section.entry, item, _related(enabled))
+            evidence = _detail_links(links, 'Configured placements')
         context = [_section_summary(value) for value in observed
                    if value.entry['id'] in shown or source
                    or (not (q or item) and (not status or value.status == status)
                        and (value.status != 'complete' or not value.complete or not value.complete['records']))]
         if context:
-            evidence = '<section class="stack"><h2>Source and section coverage</h2>' + ''.join(context) + '</section>'
-    empty = _empty_inventory(sources, source, section, sections, bool(q or item or status)) if not visible else ''
+            evidence += '<section class="stack"><h2>Source and section coverage</h2>' + ''.join(context) + '</section>'
+    empty = '' if visible else _empty_inventory(provider, sources, source, section_key, sections, bool(q or item or status))
     description = f'<p>{_e(description)}</p>' if description else ''
-    return (_section_links(path, provider, sections, section, params)
+    return (_section_links(path, provider, sections, section_key, params)
             + _filters(path, all_sources, sections, statuses, params)
             + description + count + empty + table + pagination + evidence)
