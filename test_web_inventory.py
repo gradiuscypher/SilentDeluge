@@ -1,4 +1,4 @@
-"""Synthetic HTTP acceptance for the local inventory; no live provider reads."""
+"""Synthetic CLI and HTTP acceptance for the local inventory; no live provider reads."""
 
 from base64 import b64encode
 from hashlib import pbkdf2_hmac
@@ -6,9 +6,12 @@ from http.client import HTTPConnection
 import json
 from pathlib import Path
 import re
+from subprocess import run
+import sys
 from tempfile import TemporaryDirectory
 from threading import Thread
 import unittest
+from unittest.mock import patch
 from urllib.parse import urlencode
 
 from web_inventory import make_server
@@ -18,6 +21,12 @@ _STAGE = 'theatre/stage'
 _BOOTH = 'theatre/booth'
 _SHARED = 'theatre/shared'
 _PASSWORDS = {'alice': 'synthetic-alice-password', 'bob': 'synthetic-bob-password'}
+_SCRIPT = Path(__file__).resolve().with_name('web_inventory.py')
+
+
+def _envelope(provider, scope, minute, *sections):
+    return dict(schema_version=1, source=provider, scope=scope,
+                timestamp=f'2025-01-01T10:{minute:02d}:00Z', sections=list(sections))
 
 
 def _instance(name, cpu='1'):
@@ -69,6 +78,18 @@ class WebInventoryTests(unittest.TestCase):
         path.write_text(json.dumps(dict(scope=self.config['sources'][source]['scope'],
                                         timestamp=f'2025-01-01T10:{minute:02d}:00Z',
                                         outcome=outcome, instances=instances)), encoding='utf-8')
+
+    def import_report(self, source, report, *, mode=0o600):
+        path = self.root / 'approved-report.json'
+        path.write_text(report if isinstance(report, str) else json.dumps(report), encoding='utf-8')
+        path.chmod(mode)
+        return run([sys.executable, str(_SCRIPT), 'import-evidence', '--config', str(self.path),
+                    '--source', source, '--file', str(path)],
+                   capture_output=True, text=True, timeout=5)
+
+    def import_ok(self, source, report):
+        result = self.import_report(source, report)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def request(self, method, path, user='alice', fields=None, headers=None, password=None, *, send_origin=True):
         request_headers = {}
@@ -307,6 +328,146 @@ class WebInventoryTests(unittest.TestCase):
         self.assertIn('Stale — last verified complete capture', html)
         self.assertIn('retained-sighting', html)
         self.assertNotIn(str(self.root), html)
+
+    def test_import_only_linux_shows_full_package_evidence_without_local_collection(self):
+        scope = 'theatre/paper-moon'
+        self.config['sources']['guest'] = dict(provider='linux', scope=scope, import_only=True,
+                                               read='Offline guest report only.', config={})
+        for key in ('view_scopes', 'collect_scopes'):
+            self.config['users']['alice'][key].append(scope)
+        self.start()
+        csrf = self.field(self.dashboard(), 'csrf')
+        self.assertEqual(self.post('enable', 'guest', csrf)[0], 303)
+        self.assertIn('no offline evidence imported', self.dashboard())
+        packages = [dict(asset='paper-moon', manager='dpkg', name=f'synthetic-pkg-{i:04d}',
+                         architecture='all', version='1.0') for i in range(1250)]
+        memory_time = '2025-01-01T11:03:00+01:00'
+        report = _envelope('linux', scope, 5,
+                           dict(section='packages', outcome='complete', records=packages),
+                           dict(section='cpu', outcome='complete',
+                                records=[dict(view='procfs', sample_seconds=0.2, busy_percent=0)]),
+                           dict(section='memory', outcome='complete', timestamp=memory_time,
+                                records=[dict(view='cgroup-v2', used_bytes=0, limit_bytes=None)]),
+                           dict(section='interfaces', outcome='failed', records=[]))
+        with patch('web_inventory.import_module', side_effect=AssertionError('unexpected provider read')) as provider:
+            self.import_ok('guest', report)
+            html = self.dashboard()
+            self.assertIn('Collection permission: disabled (import-only).', html)
+            self.assertNotIn('Preview one collection', html)
+            for action in ('preview', 'collect'):
+                fields = {'preview': 'X' * 43} if action == 'collect' else {}
+                status, _, body = self.post(action, 'guest', csrf, **fields)
+                self.assertEqual(status, 403)
+                self.assertIn('Collection not permitted', body)
+            self.assertEqual(self.request('GET', '/import-evidence')[0], 404)
+            self.assertEqual(self.post('import-evidence', 'guest', csrf, file='/unexpected')[0], 404)
+            self.assertEqual(self.post('enable', '/unexpected', csrf)[0], 404)
+            provider.assert_not_called()
+
+        self.assertIn('<h3>Installed packages</h3>', html)
+        self.assertRegex(html, r'<details class="disclosure"><summary>[^<]+\(1250 rows\)</summary>'
+                               r'.*synthetic-pkg-0000.*synthetic-pkg-1249.*</details>')
+        self.assertIn('guest | theatre/paper-moon | <time datetime="2025-01-01T10:05:00Z">', html)
+        self.assertIn(f'guest | theatre/paper-moon | <time datetime="{memory_time}">{memory_time}', html)
+        self.assertIn('Sample duration (s)', html)
+        self.assertIn('Busy CPU time (%)', html)
+        self.assertIn('<td>procfs</td><td>0.2</td><td>0</td>', html)
+        self.assertIn('Used (bytes)', html)
+        self.assertIn('Limit (bytes)', html)
+        self.assertIn('<td>cgroup-v2</td><td>0</td><td>null</td>', html)
+        self.assertIn('Latest section outcome: failed', html)
+        self.assertIn('Presence of omitted records is unknown.', html)
+        self.assertNotIn('synthetic-pkg-', self.dashboard('bob'))
+        self.assertEqual(self.post('disable', 'guest', csrf)[0], 303)
+        self.assertNotIn('synthetic-pkg-', self.dashboard())
+        self.assertEqual(self.post('enable', 'guest', csrf)[0], 303)
+        self.assertIn('synthetic-pkg-1249', self.dashboard())
+
+    def test_imported_incus_context_survives_comparison_and_later_incomplete_evidence(self):
+        self.config['sources']['stagelight']['declarations'] = dict(
+            source='synthetic declarations', scope=_STAGE, timestamp='2025-01-01T09:00:00Z',
+            containers=[dict(name='paper-moon', cpu='2'), dict(name='tin-piano')], vms=[],
+        )
+        self.start()
+        csrf = self.field(self.dashboard(), 'csrf')
+        record = dict(name='paper-moon', kind='container', state='Running', cpu='1', memory='256MiB',
+                      architecture='x86_64', location='synthetic-node', profiles=[], ephemeral=False,
+                      description='', generation=0, created_at='2025-01-01T09:50:00Z')
+        capture_time = '2025-01-01T10:01:00Z'
+        complete = dict(section='instances', outcome='complete', records=[record], timestamp=capture_time)
+        self.import_ok('stagelight', _envelope('incus', _STAGE, 10, complete))
+        self.assertNotIn('synthetic-node', self.dashboard())
+        self.assertEqual(self.post('enable', 'stagelight', csrf)[0], 303)
+        html = self.dashboard()
+        self.assertIn('<td>paper-moon</td><td>disagreement</td>', html)
+        self.assertIn('<td>tin-piano</td><td>absent</td>', html)
+        self.assertIn('CPU limit (count or pin set)', html)
+        self.assertIn('Memory limit (as reported)', html)
+        self.assertIn('<td>x86_64</td><td>synthetic-node</td><td>[]</td><td>false</td>'
+                      '<td>&quot;&quot;</td><td>0</td><td>2025-01-01T09:50:00Z</td>', html)
+        self.assertIn(f'Complete capture: stagelight | theatre/stage | <time datetime="{capture_time}">', html)
+        self.assertIn('— 1 row.', html)
+        self.assertIn('Latest processed offline envelope: Results received — '
+                      '<time datetime="2025-01-01T10:10:00Z">', html)
+
+        sightings = dict(section='instances', outcome='partial', records=[dict(name='partial-only')])
+        failed = dict(section='instances', outcome='failed', records=[])
+        replay = dict(complete, records=[dict(record, location='obsolete-location')])
+        for minute, sections, expected in (
+            (11, [sightings], 'Latest section outcome: partial'),
+            (12, [dict(sightings, records=[])], 'No sightings in this partial capture (0 rows).'),
+            (13, [failed], 'Latest section outcome: failed'),
+            (14, [], 'Latest section outcome: not returned'),
+            (15, [replay], 'Latest section outcome: no newer evidence'),
+        ):
+            with self.subTest(attempt=expected):
+                self.import_ok('stagelight', _envelope('incus', _STAGE, minute, *sections))
+                html = self.dashboard()
+                self.assertIn(expected, html)
+                self.assertIn('<td>paper-moon</td><td>stale</td>', html)
+                self.assertIn('<td>tin-piano</td><td>unknown</td>', html)
+                self.assertNotIn('<td>absent</td>', html)
+                self.assertIn('synthetic-node', html)
+                self.assertIn('partial-only', html)
+                self.assertNotIn('obsolete-location', html)
+                self.assertIn(f'Stale — last verified complete capture: stagelight | theatre/stage | '
+                              f'<time datetime="{capture_time}">', html)
+
+    def test_import_rejects_nonmatching_or_malformed_envelopes_without_updating_evidence(self):
+        self.start()
+        csrf = self.field(self.dashboard(), 'csrf')
+        self.assertEqual(self.post('enable', 'stagelight', csrf)[0], 303)
+        record = dict(name='retained-sighting', kind='container', state='Running', cpu=None, memory=None)
+        section = dict(section='instances', outcome='complete', records=[record])
+        self.import_ok('stagelight', _envelope('incus', _STAGE, 0, section))
+        candidate = _envelope('incus', _STAGE, 1, section)
+        bad_sections = [None, [section, section], [dict(section, extra=True)],
+                        [dict(section, timestamp='2025-01-01T10:01:00')],
+                        [dict(section, outcome='unknown')], [dict(section, outcome='failed')],
+                        [dict(section, records=['not a record'])],
+                        [dict(section, records=[dict(name='malformed-instance')])],
+                        [dict(section, records=[record, record])],
+                        [dict(section, records=[dict(record, reading=float('inf'))])]]
+        invalid = [dict(candidate, schema_version=True), dict(candidate, schema_version=2),
+                   dict(candidate, source='stagelight'), dict(candidate, source='linux'),
+                   dict(candidate, scope=_BOOTH), dict(candidate, timestamp='2025-01-01T10:01:00'),
+                   dict(candidate, extra='synthetic-secret'),
+                   json.dumps(candidate).replace('"schema_version": 1',
+                                                 '"schema_version": 1, "schema_version": 1'),
+                   *(dict(candidate, sections=sections) for sections in bad_sections)]
+        cases = [('stagelight', item, 0o600) for item in invalid]
+        cases += [('not-configured', candidate, 0o600), ('stagelight', candidate, 0o644)]
+        for source, document, mode in cases:
+            with self.subTest(source=source, document=document, mode=oct(mode)):
+                result = self.import_report(source, document, mode=mode)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, '')
+                self.assertNotIn(str(self.root), result.stderr)
+                self.assertNotIn('synthetic-secret', result.stderr)
+        html = self.dashboard()
+        self.assertIn('retained-sighting', html)
+        self.assertIn('Latest section outcome: complete', html)
+        self.assertNotIn('2025-01-01T10:01:00Z', html)
 
 
 if __name__ == '__main__':

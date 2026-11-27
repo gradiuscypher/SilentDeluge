@@ -72,14 +72,55 @@ python3 web_inventory.py serve --config "$private/web.json" --port 8765 \
 
 - Keep `web.json`, provider inputs and credentials, and the entire SQLite state directory **outside Git**. The web config and database must be private regular files owned by the serving OS user (use `0600`, no symlinks); use an existing private `state_dir` (`0700`, absolute path, no symlink). One server per state directory. Stop the server before editing configuration, and restart to apply changes. Keep the configured source ID stable for the same evidence stream; use a new ID if repointing it to a different stream.
 - Each `users` key is a local username. `password_hash` is the salted PBKDF2-SHA256 verifier emitted by `hash-password`, never a plaintext password. `view_scopes` grants access to source cards and authorization to enable or disable **that user's** evidence view. Views start disabled. `collect_scopes` is a separate subset of `view_scopes`; use `[]` for a view-only account. Grants are exact strings and apply to allowlisted sources in that scope, not to subjects named in sightings.
-- `sources` is the server allowlist. Each ID fixes the `provider` (`incus`, `unifi`, or `linux`), exact `scope`, operator-authored `read` description shown in the preview, and provider `config`. Put the scope on the source, not inside `config`. Describe the actual approved reads in `read`, not paths, credentials, or other secrets. Use only read-only provider setups from [COLLECTION.md](COLLECTION.md); use absolute paths for any configured files. Requests can select an allowed source ID, never a file path, endpoint, command, or provider. Use `{}` for an empty installation.
+- `sources` is the server allowlist. Each ID fixes the `provider` (`incus`, `unifi`, or `linux`), exact `scope`, operator-authored `read` description, and provider `config`. Put the scope on the source, not inside `config`. For collectable sources, the preview shows `read`: describe the actual approved reads, not paths, credentials, or other secrets. Use only read-only provider setups from [COLLECTION.md](COLLECTION.md); use absolute paths for any configured files. Requests can select an allowed source ID, never a file path, endpoint, command, or provider. Use `{}` for an empty installation.
+- Set `"import_only": true` and `"config": {}` for evidence collected elsewhere. Keep a `read` description of the source for operators. The card shows that collection is disabled, and the server refuses preview and collect even for an enabled viewer with `collect_scopes` for that scope. Scope grants and per-user enablement still control who can view evidence. The default is `import_only: false`.
 - `declarations` is optional and only used for Incus instance comparisons. It can be inlined in the matching scope using the offline declaration shape (`source`, `scope`, `timestamp`, `containers`, `vms`). Inventory works without declarations; even with them, runtime sightings do not establish instance absence.
-- Enable and disable affect viewing only. An enabled viewer with a collection grant can preview one manual read before confirming it. The preview states the allowed read, scope, and evidence destination. Confirmation expires after five minutes, is single-use, and never starts probes, schedules, guest access, or other monitoring. Browser POSTs need the exact served `Origin` (loopback HTTP by default, configured HTTPS in proxy mode) and an account-specific CSRF token. No request adds grants.
-- The private `inventory.sqlite3` store retains per-user view preferences and per-source evidence across restarts. Evidence is shared only with enabled viewers granted that scope. The latest attempt and each section's coverage are separate from the last verified complete capture and its age. Partial sightings are shown separately. A failed, partial, omitted, or replayed section does not replace verified complete evidence or establish absence; only a newer complete instance capture can establish an omitted declaration's absence in that population and scope, as of its capture time.
+- Enable and disable affect viewing only. For a collectable source, an enabled viewer with a collection grant can preview one manual read before confirming it. The preview states the allowed read, scope, and evidence destination. Confirmation expires after five minutes, is single-use, and never starts probes, schedules, guest access, or other monitoring. Browser POSTs need the exact served `Origin` (loopback HTTP by default, configured HTTPS in proxy mode) and an account-specific CSRF token. No request adds grants.
+- The private `inventory.sqlite3` store retains per-user view preferences and per-source evidence across restarts. Evidence is shared only with enabled viewers granted that scope. The most recently processed attempt and its section outcomes are separate from the last verified complete capture and its age. Partial sightings are shown separately. Failed, partial, omitted, and replayed sections do not replace verified complete evidence or establish absence. Only an accepted complete instance capture can establish an omitted declaration's absence in that population and scope, as of its capture time.
+
+## Import approved evidence offline
+
+Use the [collection runner](COLLECTION.md) in the already approved collection environment. For Incus, an approved saved snapshot can produce an envelope without contacting Incus. For Linux guest evidence, run the [Linux collector](LINUX.md) inside the enrolled guest, not on the web server. Save stdout from a successful run; exit `0` does not mean all sections succeeded.
+
+```sh
+# In the respective approved collection environment, not from the browser:
+umask 077
+python3 collection.py incus --config /private/incus.json > /private/stage-envelope.json
+python3 collection.py linux --config /private/linux.json > /private/guest-envelope.json
+```
+
+Configure a fixed ID per evidence stream in `sources`, with each report's exact scope. For example:
+
+```json
+{
+  "stage-baseline": {
+    "provider": "incus", "scope": "theatre/stage",
+    "read": "Import approved Incus project evidence.", "config": {}, "import_only": true
+  },
+  "guest-baseline": {
+    "provider": "linux", "scope": "theatre/paper-moon",
+    "read": "Import approved evidence collected inside the guest.", "config": {}, "import_only": true
+  }
+}
+```
+
+Grant each scope only to its approved viewers. Transfer the approved envelopes privately. On the web host, run as the OS user that owns the private web config and state, using regular, non-symlink input files owned by that user with no group or other access (`0600`):
+
+```sh
+python3 web_inventory.py import-evidence --config "$private/web.json" \
+  --source stage-baseline --file /private/stage-envelope.json
+python3 web_inventory.py import-evidence --config "$private/web.json" \
+  --source guest-baseline --file /private/guest-envelope.json
+```
+
+- `--source` is the configured ID, not the envelope's provider name. Import is also available for collectable sources. It writes to the same private database without a server restart or SQL commands; it does not enable any viewer. After enabling the source, reload the dashboard to see subsequent imports.
+- Import requires the exact version-1 `collection.py` envelope, with `source` matching the configured provider and `scope` matching exactly. The envelope timestamp and any section timestamps need explicit UTC offsets. Section names must be distinct; outcomes must be `complete`, `partial`, or `failed`; records must be objects, and failed sections must have no records. Complete Incus instance rows need unique instance names, kind, and state; effective limits, when set, are strings. Additional record fields are retained. Invalid input exits `2` without updating evidence. These checks enforce the contract, not the origin or truth of a report; import only approved files.
+- A section's timestamp takes precedence over the envelope timestamp; otherwise the envelope timestamp is the capture time. Import never dates evidence with the import time. Equal or older section captures do not replace retained evidence. Empty, failed, or partial reports are not evidence that omitted things are absent. The import command never invokes a provider or falls back to a live read. There is no HTTP import, upload, path selection, guest access, or schedule.
+- The browser shows row counts, capture times, and Linux usage units (seconds, percent, cores, and bytes). Incus declaration comparison is separate from the full observed rows, so it does not hide provider context. A dash means a field was omitted; `null`, `false`, zero, and empty strings (`""`) are distinct. Package rows are collapsed by default behind a keyboard-operable **Show … packages** disclosure. Expanding it reveals the whole capture, not a sample; all rows are delivered in the authenticated response.
 
 ## Acceptance on synthetic inputs
 
-Automated HTTP scenarios use only temporary files, loopback, and the saved synthetic runtime example:
+Automated CLI and HTTP scenarios use only temporary files, loopback, synthetic Incus and Linux envelopes, and the saved synthetic runtime example:
 
 ```sh
 python3 -m unittest -v test_web_inventory
@@ -92,6 +133,7 @@ Browser acceptance at `http://127.0.0.1:8765`:
 3. In the setup shell after stopping the server, copy `"$private/stage-failed.json"` over `"$private/stage.json"` and restart with the same command. Preview and collect again. The section reports failure, `paper-moon` is stale with its original observed fields and timestamp, and `tin-piano` is unknown, not absent. Disabling the view hides those records; re-enabling restores them without collecting.
 4. Open as Bob in a separate profile or private session. Only `booth` appears. Enable, preview, and collect; `sound-mixer` is observed without declarations. No stage source, scope, records, or actions are exposed. `/patterns` displays synthetic examples; `/style.css` serves the local stylesheet without external resources.
 5. For empty first-run behavior, stop the server and start with a new `0700` state directory and `"sources": {}` while keeping the users. Sign in and verify no sources are available; there is no prompt to create declarations or run a discovery scan.
+6. With the import-only example sources configured, use approved synthetic envelopes with distinguishable capture times. Verify imported rows are hidden before enabling; Incus context is visible alongside any comparison; the package disclosure expands with Enter or Space and includes the last row; zero usage and null limits are not blanks. Verify the import-only card has no preview, including for a collector account. The automated scenarios also check direct preview/collect denial, no provider fallback, invalid imports, and stale evidence after partial, failed, omitted, and replayed sections. They do not test live collection, transport, or deployments.
 
 ### CLI smoke: submit the same forms with curl
 

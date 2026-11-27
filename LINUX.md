@@ -13,9 +13,13 @@ Create a private configuration file, for example:
 {
   "scope": "toy-theatre/paper-moon",
   "asset": "paper-moon",
-  "packs": ["packages", "cpu", "memory", "disk", "users", "interfaces"],
+  "packs": [
+    "packages", "cpu", "memory", "disk", "users", "interfaces",
+    "system", "storage", "services", "network_links"
+  ],
   "package_manager": "dpkg",
-  "resource_view": "procfs"
+  "resource_view": "procfs",
+  "service_manager": "systemd"
 }
 ```
 
@@ -41,6 +45,73 @@ the private installation. Approve scheduling separately from the initial read.
 | `disk` | `statvfs` for `/` only: filesystem `total_bytes`, allocated `used_bytes`, and `available_bytes` to unprivileged users. Reserved blocks can make used plus available less than total. This is the root filesystem view, not whole-guest disk use or a container's quota; overlay or shared filesystems can report backing capacity and usage. No mount enumeration, disk walks, or I/O sampling. |
 | `users` | Name, UID and primary GID from the guest's `/etc/passwd` only. Includes service accounts. No NSS queries, directory users, groups, login history, password fields, GECOS, home paths or shells in evidence. |
 | `interfaces` | Name and index in the collector's current network namespace, including loopback. Indices can change. No addresses, MACs, routes, DNS, counters, traffic capture or remote queries. |
+| `system` | One record with `os_id` and `os_version` from `ID` and `VERSION_ID` in `/etc/os-release` (or `/usr/lib/os-release` if absent); `os_version` is `null` if not set. `kernel_release` and `architecture` are the kernel's `uname` release and machine values, not package architecture. `boot_time_unix_seconds` is `/proc/stat` `btime` (integer seconds since the Unix epoch); `uptime_seconds` is `/proc/uptime` elapsed seconds since boot with centisecond precision. |
+| `storage` | One record per eligible filesystem mount at `/`, `/boot`, `/boot/efi`, `/usr` or `/var` in the current mount namespace. Fields: `path`, `filesystem` (Linux filesystem type), `total_bytes`, `used_bytes`, `available_bytes` with the same units and reservation semantics as `disk`. |
+| `services` | System-wide native service name and metadata state. Fields: `manager`, `name`, `state`. Set `service_manager` to `systemd` (the default) for installed definitions, or `openrc` for started markers. These states are not service health checks. |
+| `network_links` | `name` and `ifindex` as in `interfaces`, plus Linux `operstate`, configured `mtu_bytes`, numeric `arphrd_type`, and cumulative `rx_bytes`/`tx_bytes`. Includes loopback. This opt-in does not change the fields or reads of `interfaces`. |
+
+### System and boot scope
+
+Requires readable OS release metadata and procfs plus an unprivileged `uname`.
+The OS ID/version describe the guest's userspace; a container normally shares
+its host kernel. Boot time and uptime describe the procfs view. They can
+describe the host's boot, or be virtualized differently in a container; they
+are not a guest start timestamp and are not reconciled. No hostname, machine
+ID or boot ID is reported.
+
+### Storage scope
+
+Requires readable `/proc/self/mountinfo` and search access to the scoped mount
+paths; no directory listings or tree walks. `/` must be listed; other paths
+are queried only when they are mountpoints in their own right. Symlink
+components are not followed. Non-root subtree mounts (including bind-mounted
+subtrees or subvolumes) at the optional paths are skipped. No `/home`,
+`/run`, `/etc`, removable media trees, or arbitrary configured paths are
+queried. Device and mount source names, mount roots and options are not
+included in evidence.
+
+Supported filesystem types: `bcachefs`, `btrfs`, `erofs`, `exfat`, `ext2`,
+`ext3`, `ext4`, `f2fs`, `jfs`, `ntfs3`, `overlay`, `squashfs`, `tmpfs`,
+`vfat`, `xfs`, and `zfs`. A remaining scoped mount with an unsupported type
+or ambiguous stacked mounts makes the section unknown; there is no fallback.
+Capacity is per visible filesystem, not total host or guest disk capacity.
+Do not sum rows: filesystems can share backing storage and may not reflect
+container quotas. Mount enumeration and capacity reads are not atomic.
+
+### Service coverage
+
+- **systemd:** Requires search access to the fixed system paths and permission
+  to list their existing directories. Reads top-level entries only, in
+  precedence order: `/etc/systemd/system`, `/run/systemd/system`,
+  `/usr/local/lib/systemd/system`, `/usr/lib/systemd/system`, then
+  `/lib/systemd/system`. A `/lib` symlink directly to `usr/lib` or `/usr/lib`
+  is treated as the already checked vendor path. Reports `installed` for a
+  regular unit file, `masked` for a direct symlink to `/dev/null`, and `linked`
+  for another symlink without verifying its target. Does not report enablement,
+  runtime state, user units, drop-ins, generated units, or concrete template
+  instances (which can contain paths). At least one scoped directory must be
+  readable.
+- **OpenRC:** Requires search access and permission to list
+  `/run/openrc/started`. Reports `started` for plain service names present
+  as markers, not for installed but stopped services. Does not verify that a
+  process is running. A missing marker directory is unknown, not empty.
+
+Neither view follows service links, opens unit or init script contents,
+queries user managers, or traverses users' home directories. Link targets are
+not emitted. Other init systems and alternate service directories are
+unsupported; no fallback to a different manager.
+
+### Network link fields
+
+Requires namespace interface enumeration and readable guest sysfs
+`/sys/class/net` attributes for those links. Sysfs indices must match the
+enumerated ones. `operstate` is the kernel's operational state (`up`, `down`,
+`lowerlayerdown`, `dormant`, `testing`, `notpresent`, or the literal `unknown`).
+`arphrd_type` is the Linux link-layer type (e.g. `1` for Ethernet framing or
+`772` for loopback), not a virtual device classification. RX and TX values are
+unsigned byte totals, not rates; they can reset when a link is recreated or
+its driver resets. Fields are not sampled atomically. No addresses, MACs,
+routes, DNS, payloads, or remote queries.
 
 ## Choosing the resource view
 

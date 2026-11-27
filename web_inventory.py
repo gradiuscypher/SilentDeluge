@@ -38,6 +38,30 @@ _STYLE_HASH = b64encode(sha256(styles().encode('utf-8')).digest()).decode('ascii
 _CSP = (f"default-src 'none'; style-src 'self' 'sha256-{_STYLE_HASH}'; "
         "form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
 
+_SECTION_LABELS = {
+    ('incus', 'instances'): ('Incus instances', 'Instance state, effective limits, and provider context.'),
+    ('incus', 'runtime'): ('Runtime sightings', 'Runtime sightings do not cover the instance inventory.'),
+    ('linux', 'packages'): ('Installed packages', 'Packages recorded by the guest’s selected package manager.'),
+    ('linux', 'cpu'): ('CPU usage', 'Sampled CPU usage in the reported accounting view, not CPU capacity.'),
+    ('linux', 'memory'): ('Memory', 'Usage and capacity in the reported accounting view. '
+                          'A null limit means uncapped at that cgroup.'),
+    ('linux', 'disk'): ('Root filesystem', 'Space usage for the root filesystem, not all guest storage.'),
+    ('linux', 'users'): ('Local accounts', 'Local user names, UIDs, and primary GIDs.'),
+    ('linux', 'interfaces'): ('Network interfaces', 'Names and indices in the observed network namespace.'),
+}
+_FIELD_LABELS = {
+    'incus': {'cpu': 'CPU limit (count or pin set)', 'memory': 'Memory limit (as reported)'},
+    'linux': {
+        'sample_seconds': 'Sample duration (s)',
+        'busy_percent': 'Busy CPU time (%)',
+        'cpu_cores_used': 'Average CPU usage (cores)',
+        'total_bytes': 'Total (bytes)',
+        'used_bytes': 'Used (bytes)',
+        'available_bytes': 'Available (bytes)',
+        'limit_bytes': 'Limit (bytes)',
+    },
+}
+
 
 @dataclass(frozen=True)
 class _User:
@@ -56,6 +80,7 @@ class _Source:
     read: str
     config: dict
     declarations: dict | None
+    import_only: bool
 
     @property
     def key(self):
@@ -66,7 +91,7 @@ class _Source:
 def _unique_object(pairs):
     result = dict(pairs)
     if len(result) != len(pairs):
-        raise ValueError('duplicate configuration key')
+        raise ValueError('duplicate JSON key')
     return result
 
 
@@ -113,14 +138,18 @@ def _declarations(document, scope):
 
 def _check_private(info, kind):
     if not kind(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-        raise ValueError('configuration and state must be private and owned by the server user')
+        raise ValueError('expected a private file or directory owned by the server user')
 
 
-def _load_config(path):
+def _load_private_json(path):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, encoding='utf-8') as stream:
         _check_private(os.fstat(stream.fileno()), stat.S_ISREG)
-        config = json.load(stream, object_pairs_hook=_unique_object)
+        return json.load(stream, object_pairs_hook=_unique_object)
+
+
+def _load_config(path):
+    config = _load_private_json(path)
     _shape(config, {'state_dir', 'users', 'sources'})
     if not _text(config['state_dir']) or not Path(config['state_dir']).is_absolute():
         raise ValueError('state_dir must be an absolute path')
@@ -140,18 +169,20 @@ def _load_config(path):
         raise ValueError('sources must be an object')
     sources = {}
     for name, source in config['sources'].items():
-        _shape(source, {'provider', 'scope', 'read', 'config'}, {'declarations'})
+        _shape(source, {'provider', 'scope', 'read', 'config'}, {'declarations', 'import_only'})
         provider, scope, read, settings = (source[key] for key in ('provider', 'scope', 'read', 'config'))
+        import_only = source.get('import_only', False)
         if (not _ID.fullmatch(name) or not isinstance(provider, str) or provider not in _PROVIDERS
                 or not _text(scope) or not _text(read) or not isinstance(settings, dict)
-                or 'scope' in settings):
+                or 'scope' in settings or type(import_only) is not bool or (import_only and settings)):
             raise ValueError('invalid allowlisted source')
         declarations = None
         if 'declarations' in source:
             if provider != 'incus':
                 raise ValueError('declarations are only supported for Incus instances')
             declarations = _declarations(source['declarations'], scope)
-        sources[name] = _Source(name, provider, scope, read, dict(settings, scope=scope), declarations)
+        sources[name] = _Source(name, provider, scope, read, dict(settings, scope=scope),
+                                declarations, import_only)
     return users, sources, Path(config['state_dir'])
 
 
@@ -193,39 +224,84 @@ def _timestamp():
     return datetime.now(timezone.utc).isoformat().removesuffix('+00:00') + 'Z'
 
 
+def _validate_captures(provider, sections):
+    _validate_sections(sections)
+    names = set()
+    for section in sections:
+        name, outcome, records = (section[key] for key in ('section', 'outcome', 'records'))
+        if not _text(name) or name in names or (outcome == 'failed' and records):
+            raise ValueError('invalid observation section')
+        names.add(name)
+        if provider == 'incus' and name == 'instances' and outcome == 'complete':
+            # Only this population feeds declaration comparison; other fields remain source-local.
+            guests = set()
+            for row in records:
+                guest = row.get('name')
+                if (not _text(guest) or guest in guests or not _text(row.get('state'))
+                        or row.get('kind') not in ('container', 'virtual-machine')
+                        or any(row.get(key) is not None and not isinstance(row[key], str)
+                               for key in ('cpu', 'memory'))):
+                    raise ValueError('invalid complete Incus instance')
+                guests.add(guest)
+    json.dumps(sections, allow_nan=False)
+
+
+def _save_evidence(db, source, timestamp, sections, *, imported=False, outcome=None):
+    # The HTTP server and operator CLI can both write; lock before reading history.
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        state = _state(db, source) or {'sections': {}}
+        results = {}
+        for section in sections:
+            name = section['section']
+            capture = section.get('timestamp', timestamp)
+            history = state['sections'].setdefault(name, {})
+            if 'latest' in history and _instant(capture) <= _instant(history['latest']):
+                results[name] = {'outcome': 'no newer evidence', 'timestamp': capture}
+                continue
+            result = section['outcome']
+            results[name] = {'outcome': result, 'timestamp': capture}
+            history['latest'] = capture
+            if result == 'complete':
+                history['complete'] = {'timestamp': capture, 'records': section['records']}
+                history.pop('partial', None)
+            elif result == 'partial' and section['records']:
+                history['partial'] = {'timestamp': capture, 'records': section['records']}
+        if outcome is None:
+            outcome = 'Results received' if sections else 'No sections returned'
+        state.update(timestamp=timestamp, outcome=outcome, results=results, imported=imported)
+        db.execute('INSERT INTO evidence VALUES (?, ?) ON CONFLICT(source) DO UPDATE SET state=excluded.state',
+                   (source.key, json.dumps(state, allow_nan=False)))
+
+
 def _collect(db, source):
-    state = _state(db, source) or {'sections': {}}
+    outcome = None
     try:
         sections = import_module(_PROVIDERS[source.provider]).collect(source.config)
-        _validate_sections(sections)
-        if len({section['section'] for section in sections}) != len(sections):
-            raise ValueError('duplicate observation section')
-        json.dumps(sections, allow_nan=False)
-        outcome = 'Results received' if sections else 'No sections returned'
+        timestamp = _timestamp()
+        _validate_captures(source.provider, sections)
     except (Exception, SystemExit):
         # Provider diagnostics can contain paths, credentials or response bodies.
-        sections, outcome = [], 'Collection failed'
+        timestamp, sections, outcome = _timestamp(), [], 'Collection failed'
+    _save_evidence(db, source, timestamp, sections, outcome=outcome)
 
-    timestamp = _timestamp()
-    results = {}
-    for section in sections:
-        name = section['section']
-        capture = section.get('timestamp', timestamp)
-        history = state['sections'].setdefault(name, {})
-        if 'latest' in history and _instant(capture) <= _instant(history['latest']):
-            results[name] = {'outcome': 'no newer evidence', 'timestamp': capture}
-            continue
-        result = section['outcome']
-        results[name] = {'outcome': result, 'timestamp': capture}
-        history['latest'] = capture
-        if result == 'complete':
-            history['complete'] = {'timestamp': capture, 'records': section['records']}
-            history.pop('partial', None)
-        elif result == 'partial' and section['records']:
-            history['partial'] = {'timestamp': capture, 'records': section['records']}
-    state.update(timestamp=timestamp, outcome=outcome, results=results)
-    db.execute('INSERT INTO evidence VALUES (?, ?) ON CONFLICT(source) DO UPDATE SET state=excluded.state',
-               (source.key, json.dumps(state, allow_nan=False)))
+
+def _import_evidence(config_path, source_id, report_path):
+    _, sources, state_dir = _load_config(config_path)
+    source = sources.get(source_id)
+    if source is None:
+        raise ValueError('source ID not configured')
+    envelope = _load_private_json(report_path)
+    _shape(envelope, {'schema_version', 'source', 'scope', 'timestamp', 'sections'})
+    version, timestamp = envelope['schema_version'], envelope['timestamp']
+    if (type(version) is not int or version != 1 or envelope['source'] != source.provider
+            or envelope['scope'] != source.scope or not _text(timestamp)
+            or _instant(timestamp).utcoffset() is None):
+        raise ValueError('invalid evidence provenance')
+    sections = envelope['sections']
+    _validate_captures(source.provider, sections)
+    with closing(sqlite3.connect(_open_store(state_dir))) as db:
+        _save_evidence(db, source, timestamp, sections, imported=True)
 
 
 def _e(value):
@@ -233,23 +309,35 @@ def _e(value):
 
 
 def _cell(value):
-    return _e(value if isinstance(value, str) else json.dumps(value, ensure_ascii=False))
+    return _e(value if isinstance(value, str) and value else json.dumps(value, ensure_ascii=False))
 
 
-def _table(headers, rows):
+def _table(caption, headers, rows):
     heading = ''.join(f'<th scope="col">{_e(header)}</th>' for header in headers)
-    return '<table class="data-table"><thead><tr>' + heading + '</tr></thead><tbody>' + ''.join(
-        '<tr>' + ''.join(f'<td>{_cell(value)}</td>' for value in row) + '</tr>' for row in rows
-    ) + '</tbody></table>'
+    return (f'<table class="data-table"><caption>{_e(caption)}</caption><thead><tr>{heading}</tr></thead>'
+            '<tbody>' + ''.join(
+                '<tr>' + ''.join(f'<td>{_cell(value)}</td>' for value in row) + '</tr>' for row in rows
+            ) + '</tbody></table>')
 
 
-def _records(records):
+def _capture(source, name, label, capture, now):
+    records = capture['records']
+    count = len(records)
+    rows_label = f'{count} {"row" if count == 1 else "rows"}'
+    citation = _citation(source.id, source.scope, capture['timestamp'], now)
+    summary = f'<p>{label}: {citation} — {rows_label}.</p>'
     if not records:
-        return '<p>No records in this capture.</p>'
+        return summary + '<p>No records in this capture.</p>'
     columns = dict.fromkeys(key for row in records for key in row)
     if not columns:
-        return f'<p>{len(records)} records with no fields.</p>'
-    return _table(columns, ([row.get(key, '—') for key in columns] for row in records))
+        return summary + '<p>Records have no fields.</p>'
+    field_labels = _FIELD_LABELS.get(source.provider, {})
+    table = _table(label, (field_labels.get(key, key) for key in columns),
+                   ([row.get(key, '—') for key in columns] for row in records))
+    if (source.provider, name) == ('linux', 'packages'):
+        table = (f'<details class="disclosure"><summary>Show {label.lower()} packages ({rows_label})</summary>'
+                 f'{table}</details>')
+    return summary + table
 
 
 def _date(timestamp, now):
@@ -283,7 +371,8 @@ def _comparison(source, complete, outcome, now):
     html = '<p>Declarations: ' + _citation(declaration['source'], declaration['scope'],
                                            declaration['timestamp'], now) + '</p>'
     if rows:
-        html += _table(('Instance', 'Status', 'Declared', 'Observed', 'Differing fields'), rows)
+        html += _table('Declaration comparison', ('Instance', 'Status', 'Declared', 'Observed', 'Differing fields'),
+                       rows)
     else:
         html += '<p>No declared or observed instances.</p>'
     return html
@@ -294,17 +383,22 @@ def _inventory(source, state, now):
     if source.declarations is None:
         parts.append('<p>No declarations configured.</p>')
     if state is None:
-        parts.append('<p>Not connected: no collection attempted.</p>')
+        parts.append('<p>Not connected: no offline evidence imported.</p>' if source.import_only
+                     else '<p>Not connected: no collection attempted.</p>')
         if source.declarations is not None:
             parts.append(_comparison(source, None, None, now))
         return ''.join(parts)
 
-    parts.append(f'<p>Latest collection: {_e(state["outcome"])} — {_date(state["timestamp"], now)}.</p>')
+    label = 'Latest processed offline envelope' if state.get('imported') else 'Latest collection'
+    parts.append(f'<p>{label}: {_e(state["outcome"])} — {_date(state["timestamp"], now)}.</p>')
     names = state['sections'].keys() | ({'instances'} if source.declarations is not None else set())
     if not names:
         parts.append('<p>No observations available. Presence is unknown.</p>')
     for name in sorted(names):
-        parts.append(f'<section class="stack"><h3>{_e(name)}</h3>')
+        title, description = _SECTION_LABELS.get((source.provider, name), (name, ''))
+        parts.append(f'<section class="stack"><h3>{_e(title)}</h3>')
+        if description:
+            parts.append(f'<p>{_e(description)}</p>')
         result = state['results'].get(name)
         outcome = result['outcome'] if result else 'not returned'
         parts.append(f'<p>Latest section outcome: {_e(outcome)}' +
@@ -313,20 +407,17 @@ def _inventory(source, state, now):
             parts.append('<p>Presence of omitted records is unknown.</p>')
         history = state['sections'].get(name, {})
         complete, partial = history.get('complete'), history.get('partial')
-        if complete:
-            label = 'Complete capture' if outcome == 'complete' else 'Stale — last verified complete capture'
-            parts.append(f'<p>{label}: {_citation(source.id, source.scope, complete["timestamp"], now)}.</p>')
         if source.declarations is not None and name == 'instances':
             parts.append(_comparison(source, complete, outcome, now))
-        elif complete:
-            parts.append(_records(complete['records']))
+        if complete:
+            label = 'Complete capture' if outcome == 'complete' else 'Stale — last verified complete capture'
+            parts.append(_capture(source, name, label, complete, now))
+        current_partial = partial and outcome == 'partial' and result['timestamp'] == partial['timestamp']
+        if outcome == 'partial' and not current_partial:
+            parts.append('<p>No sightings in this partial capture (0 rows).</p>')
         if partial:
-            label = ('Partial sightings' if result and outcome == 'partial'
-                     and result['timestamp'] == partial['timestamp'] else 'Stale — retained partial sightings')
-            parts.append(f'<p>{label}: {_citation(source.id, source.scope, partial["timestamp"], now)}.</p>')
-            parts.append(_records(partial['records']))
-        elif not complete and outcome == 'partial':
-            parts.append('<p>No sightings in this partial capture.</p>')
+            label = 'Partial sightings' if current_partial else 'Stale — retained partial sightings'
+            parts.append(_capture(source, name, label, partial, now))
         parts.append('</section>')
     return ''.join(parts)
 
@@ -347,6 +438,10 @@ def _form(action, source, user, label, preview=None):
     return f'<form method="post" action="/{action}">{fields}<button type="submit">{label}</button></form>'
 
 
+def _may_collect(source, user):
+    return not source.import_only and source.scope in user.collect
+
+
 def _dashboard(db, username, user, sources):
     visible = [source for source in sources.values() if source.scope in user.view]
     body = [f'<p>Signed in as <strong>{_e(username)}</strong>.</p>']
@@ -355,11 +450,13 @@ def _dashboard(db, username, user, sources):
     now = datetime.now(timezone.utc)
     for source in visible:
         enabled = _enabled(db, username, source)
-        allowed = source.scope in user.collect
+        allowed = _may_collect(source, user)
+        permission = ('disabled (import-only)' if source.import_only else
+                      'granted' if allowed else 'not granted')
         body.append(f'<section class="panel" id="{_e(source.id)}"><h2>{_e(source.id)}</h2>'
                     f'<p>Provider: {_e(source.provider)} | Scope: {_e(source.scope)}</p>'
                     f'<p>Evidence view: {"enabled" if enabled else "disabled"}. '
-                    f'Collection permission: {"granted" if allowed else "not granted"}.</p>')
+                    f'Collection permission: {permission}.</p>')
         action = 'disable' if enabled else 'enable'
         body.append(_form(action, source, user, f'{action.capitalize()} evidence view'))
         if enabled:
@@ -511,7 +608,7 @@ class _Handler(BaseHTTPRequestHandler):
                     db.execute('DELETE FROM enabled WHERE username=? AND source=?', (username, source.key))
             previews.pop(username, None)
         else:
-            if source.scope not in user.collect or not _enabled(db, username, source):
+            if not _may_collect(source, user) or not _enabled(db, username, source):
                 self._message(403, 'Collection not permitted')
                 return
             if self.path == '/preview':
@@ -525,8 +622,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self._message(403, 'A fresh collection preview is required')
                 return
             del previews[username]
-            with db:
-                _collect(db, source)
+            _collect(db, source)
         self._send(303, Location=f'/#{source.id}')
 
 
@@ -569,6 +665,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     commands = parser.add_subparsers(dest='command', required=True)
     commands.add_parser('hash-password', help='prompt for a password and emit a salted verifier')
+    ingest = commands.add_parser('import-evidence', help='import a private collection.py JSON envelope',
+                                 allow_abbrev=False)
+    ingest.add_argument('--config', type=Path, required=True)
+    ingest.add_argument('--source', required=True, metavar='ID')
+    ingest.add_argument('--file', type=Path, required=True)
     serve = commands.add_parser('serve', help='serve inventory on 127.0.0.1')
     serve.add_argument('--config', type=Path, required=True)
     serve.add_argument('--port', type=int, default=8765)
@@ -584,6 +685,13 @@ def main():
             parser.exit(2, 'Could not read matching passwords.\n')
         salt = token_bytes(16)
         print(f'pbkdf2-sha256${_ITERATIONS}${salt.hex()}${_derive(password, salt).hex()}')
+        return
+    if args.command == 'import-evidence':
+        try:
+            _import_evidence(args.config, args.source, args.file)
+        except (OSError, ValueError, TypeError, RecursionError, sqlite3.Error):
+            parser.exit(2, 'Could not import evidence: check private files, source ID and envelope contract.\n')
+        print('Evidence envelope processed.')
         return
     if not 0 <= args.port <= 65535:
         parser.error('port must be between 0 and 65535')

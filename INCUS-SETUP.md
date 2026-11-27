@@ -8,8 +8,8 @@ captures, configs, endpoint names, credentials and acceptance records private.
 
 | Path | Identity | Evidence |
 | --- | --- | --- |
-| Operator pushes a fixed-field inventory export | Existing approved operator-side access with whole-project visibility | Name, kind, state, effective CPU/memory limits, including stopped guests |
-| Separate metrics capture | Dedicated TLS trust entry of type `metrics`, not `client` | Running guest sightings only; no effective limits, stopped guests, or evidence of absence |
+| Operator pushes a fixed-field inventory export | Existing approved operator-side access with whole-project visibility | Name, kind, state, effective CPU/memory limits and optional instance metadata, including stopped guests |
+| Separate metrics capture | Dedicated TLS trust entry of type `metrics`, not `client` | Running guest sightings and available measurements; no effective limits, stopped guests, or evidence of absence |
 
 ## Whole-project inventory: operator-pushed export
 
@@ -36,10 +36,25 @@ captures, configs, endpoint names, credentials and acceptance records private.
    The exporter records UTC time at the read, checks the response, and writes
    only `source`, `scope`, `timestamp`, `outcome` and `instances`. Each instance
    has `name`, `type`, `status`, and `expanded_config` containing only
-   `limits.cpu` and `limits.memory` when set. The raw API response stays in
-   memory on the operator side. The output is atomically replaced on success
-   and is private (mode `0600`). On error nothing new is published; never reuse
-   an old file as evidence of a new read.
+   `limits.cpu` and `limits.memory` when set. Optional fields are `architecture`,
+   `location` (cluster member), `profiles` (ordered names, no profile contents),
+   `ephemeral` (boolean), `created_at` and `last_used_at` (Incus's last start
+   timestamp). Timestamps keep their supplied offsets; missing fields, empty
+   architecture/location and Incus's zero-time sentinel are omitted.
+
+   Every API instance must include an `expanded_config` mapping. An explicit
+   `{}` is valid; omission leaves effective limits unknown. If any instance
+   omits the mapping, the exporter fails without publishing a snapshot.
+
+   An API `project` field, when present, must exactly match the project in
+   `--scope`; the export keeps the scope, not the redundant project field.
+   If Incus does not report a project, the scope is still the operator's
+   attestation. Neither check proves the remote alias or the identity's
+   whole-project visibility.
+
+   The raw API response stays in operator-side memory. The output is atomically
+   replaced on success and is private (mode `0600`). On error nothing new is
+   published; never reuse an old file as evidence of a new read.
 4. Review the new file privately and push just that file to the consumer using
    the approved transfer path. Keep it in a private, operator-controlled
    location readable by the collection account. Stage updates and rename them
@@ -169,21 +184,40 @@ contain either or both inputs. Example values:
 For export-only, omit both `metrics_*` fields. For metrics-only, omit
 `snapshot_path` and use the value from `captured-at` for `metrics_timestamp`.
 The scope must match the snapshot exactly; metrics require explicit
-`server/project` and only the matching project label contributes sightings.
-The wrapper's UTC timestamp dates the import; the `instances` and `runtime`
-section timestamps date the evidence and may differ. Runtime is always
-`partial`, including when there are no sightings. Repeated guest series count
-once, and runtime records carry no CPU or memory limit claims. Invalid inputs
-stop import; they never yield an empty `complete` section.
+`server/project` and only matching project labels contribute guest evidence.
+Instance records retain the optional inventory fields when supplied. The
+wrapper's UTC timestamp dates the import; the `instances` and `runtime`
+section timestamps date the evidence and may differ.
+
+Runtime is always `partial`, including when there are no sightings. Each
+guest has at most one row. `measurements` retains only the following
+[Incus instance metrics](https://linuxcontainers.org/incus/docs/main/reference/provided_metrics/#instance-metrics):
+
+| Field | Meaning |
+| --- | --- |
+| `memory_rss_bytes` | Container RSS as reported by `incus_memory_RSS_bytes`, in bytes; not total memory use |
+| `memory_available_bytes` | VM guest-available memory in bytes, retained only with a positive guest clock and reported total memory; QEMU-only fallback estimates are excluded |
+| `cpu_seconds_total` | Cumulative `incus_cpu_seconds_total` user/system counters in seconds, per reported numeric `cpu_index` or without an index for an aggregate series. Incus can report VM vCPU thread counters from the host when the agent is unavailable. These are neither utilization nor a configured limit. |
+| `uptime_seconds` | `incus_time_seconds` minus `incus_boot_time_seconds` when both are reported for the same guest and the boot time is positive and not after the guest clock. Not derived from scrape time, daemon uptime or inventory timestamps. |
+
+Missing measurements are omitted, not filled with zero. Measured rows include
+`capture` with `source: "incus-prometheus"`, the configured `scope`, and the
+operator-supplied capture `timestamp` (not import time or an exact sampling
+time; Incus may cache metrics). No raw labels, raw config, endpoint or file
+paths are included in records. Keep raw captures private. A capture containing
+only legacy CPU sightings without a mode or boot times without a guest clock
+still imports as sightings. Invalid inputs never yield an empty `complete`
+section.
 
 Before enabling either live path, preview the approved scope, identity, exact
 read, effective permissions and retained fields. Accept each path with one
 operator-approved read, not a recurring job. Privately verify the export
-includes stopped guests and inherited limits if present, or that the metrics
-capture yields only scoped positive sightings. Check the capture time survives
-import unchanged. Use synthetic replays of incomplete evidence to check
-absence semantics rather than inducing a live failure. Record version, endpoint,
-identity or transfer reference, verified grants, capture time, observed result
-and revocation steps; mark any unverified property explicitly. Report only
-sanitized status. Live acceptance does not authorize scheduling or guest
-inspection.
+includes stopped guests, inherited limits and optional fields if present.
+For metrics, check that only scoped positive sightings appear and compare any
+measurements to the corresponding guest samples and units. Check capture
+times survive import unchanged. Use synthetic replays to verify incomplete
+evidence and project-mismatch handling rather than inducing a live failure.
+Record version, endpoint, identity or transfer reference, verified grants,
+capture time, observed result and revocation steps; mark any unverified
+property explicitly. Report only sanitized status. Live acceptance does not
+authorize scheduling or guest inspection.

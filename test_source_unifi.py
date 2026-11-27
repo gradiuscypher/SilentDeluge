@@ -1,5 +1,6 @@
 """UniFi collector tests over synthetic HTTP responses; no socket is opened."""
 
+from datetime import datetime, timedelta
 from http.client import HTTPSConnection
 from io import BytesIO
 import json
@@ -35,6 +36,10 @@ def response(payload, status=200, headers=()):
 def get(resource, offset=0):
     return (f"GET /proxy/network/integration/v1/sites/{SITE}/{resource}"
             f"?offset={offset}&limit=200 HTTP/1.1").encode()
+
+
+def get_device(device, suffix=""):
+    return (f"GET /proxy/network/integration/v1/sites/{SITE}/devices/{device}{suffix} HTTP/1.1").encode()
 
 
 class Wire:
@@ -86,12 +91,17 @@ class UniFiTest(unittest.TestCase):
         sections, requests = self.capture(
             response(page({"id": DEVICE.upper(), "name": "Stage switch", "model": "Switch",
                            "state": "OFFLINE", "macAddress": "02:00:00:00:00:01",
-                           "ipAddress": "192.0.2.1", "firmwareUpdatable": True}, total=2,
+                           "ipAddress": "192.0.2.1", "firmwareVersion": "6.6.55", "supported": False,
+                           "firmwareUpdatable": True, "features": ["switching", {"internal": KEY}],
+                           "interfaces": ["ports"], "serialNumber": KEY}, total=2,
                           next="https://elsewhere.invalid/")),
             response(page({"id": OTHER_DEVICE, "name": "Lobby AP", "state": "ONLINE"}, offset=1, total=2)),
             response(page({"id": DEVICE, "name": "Ticket booth", "type": "WIRELESS",
-                           "macAddress": "02:00:00:00:00:02", "access": {"ignored": True}}, total=2)),
-            response(page({"id": VPN, "name": "Remote crew", "type": "VPN", "macAddress": None},
+                           "macAddress": "02:00:00:00:00:02", "uplinkDeviceId": OTHER_DEVICE.upper(),
+                           "connectedAt": "2026-10-01T10:00:00+00:00",
+                           "access": {"type": "GUEST", "authorized": False, "voucher": KEY}}, total=2)),
+            response(page({"id": VPN, "name": "Remote crew", "type": "VPN", "macAddress": None,
+                           "uplinkDeviceId": OTHER_DEVICE, "access": {"type": "DEFAULT", "authorized": True}},
                           offset=1, total=2)),
         )
         self.assertEqual([request.split(b"\r\n", 1)[0] for request in requests],
@@ -102,15 +112,136 @@ class UniFiTest(unittest.TestCase):
         self.assertEqual(sections, [
             {"section": "managed_devices", "outcome": "complete", "records": [
                 {"id": f"unifi:{SITE}:managed_devices:{DEVICE}", "name": "Stage switch", "model": "Switch",
-                 "state": "OFFLINE", "mac_address": "02:00:00:00:00:01", "ip_address": "192.0.2.1"},
+                 "state": "OFFLINE", "mac_address": "02:00:00:00:00:01", "ip_address": "192.0.2.1",
+                 "firmware_version": "6.6.55", "supported": False, "firmware_updatable": True,
+                 "features": ["switching"], "interfaces": ["ports"]},
                 {"id": f"unifi:{SITE}:managed_devices:{OTHER_DEVICE}", "name": "Lobby AP", "state": "ONLINE"},
             ]},
             {"section": "connected_clients", "outcome": "complete", "records": [
                 {"id": f"unifi:{SITE}:connected_clients:{DEVICE}", "name": "Ticket booth", "type": "WIRELESS",
-                 "mac_address": "02:00:00:00:00:02"},
-                {"id": f"unifi:{SITE}:connected_clients:{VPN}", "name": "Remote crew", "type": "VPN"},
+                 "mac_address": "02:00:00:00:00:02", "uplink_device_id": OTHER_DEVICE,
+                 "connected_at": "2026-10-01T10:00:00+00:00", "access_type": "GUEST", "guest_authorized": False},
+                {"id": f"unifi:{SITE}:connected_clients:{VPN}", "name": "Remote crew", "type": "VPN",
+                 "access_type": "DEFAULT"},
             ]},
         ])
+
+    def test_bad_optional_overview_fields_do_not_lose_sightings_or_enable_reads(self):
+        sections, _ = self.capture(
+            response(page({"id": DEVICE, "name": "Stage switch", "supported": 1, "firmwareUpdatable": None,
+                           "firmwareVersion": {"private": KEY}, "features": [KEY], "interfaces": []})),
+            response(page({"id": VPN, "type": "WIRED", "connectedAt": "2026-10-01",
+                           "uplinkDeviceId": "../clients", "access": {"type": "GUEST", "authorized": 0}})),
+            config={**CONFIG, "device_details": "true", "device_statistics": 1},
+        )
+        self.assertEqual(sections, [
+            {"section": "managed_devices", "outcome": "complete", "records": [
+                {"id": f"unifi:{SITE}:managed_devices:{DEVICE}", "name": "Stage switch", "interfaces": []},
+            ]},
+            {"section": "connected_clients", "outcome": "complete", "records": [
+                {"id": f"unifi:{SITE}:connected_clients:{VPN}", "type": "WIRED", "access_type": "GUEST"},
+            ]},
+        ])
+
+    def test_optional_device_reads_project_lifecycle_link_and_timestamped_metrics(self):
+        adopted = "2026-01-01T01:00:00+01:00"
+        provisioned = "2026-10-01T10:00:00Z"
+        heartbeat = "2026-10-01T11:00:00Z"
+        sections, requests = self.capture(
+            response(page({"id": DEVICE.upper(), "state": "OFFLINE", "firmwareVersion": "6.6.55"})),
+            response(page()),
+            response({"id": DEVICE.upper(), "state": "ONLINE", "firmwareVersion": "6.7.0",
+                      "adoptedAt": adopted, "provisionedAt": provisioned, "configurationId": KEY,
+                      "uplink": {"deviceId": OTHER_DEVICE.upper(), "private": KEY},
+                      "interfaces": {
+                          "ports": [{"idx": 1, "state": "UP", "connector": "RJ45", "maxSpeedMbps": 2500,
+                                     "speedMbps": 1000, "poe": {"standard": "802.3at", "enabled": False,
+                                                               "state": "DOWN", "ignored": KEY}},
+                                    {"idx": 2, "state": "DOWN", "speedMbps": None}, {"idx": False}],
+                          "radios": [{"frequencyGHz": "5", "wlanStandard": "802.11ax", "channel": 36,
+                                      "channelWidthMHz": 40, "private": KEY}],
+                      }}),
+            response({"uptimeSec": 0, "lastHeartbeatAt": heartbeat, "nextHeartbeatAt": provisioned,
+                      "loadAverage1Min": 0.125, "loadAverage5Min": None, "loadAverage15Min": 1.5,
+                      "cpuUtilizationPct": 0, "memoryUtilizationPct": 12.5,
+                      "uplink": {"txRateBps": 1024, "rxRateBps": 4096},
+                      "interfaces": {"radios": [{"frequencyGHz": "5", "txRetriesPct": 2.25},
+                                                 {"frequencyGHz": "6", "txRetriesPct": None}]}}),
+            config={**CONFIG, "device_details": True, "device_statistics": True},
+        )
+        self.assertEqual([request.split(b"\r\n", 1)[0] for request in requests], [
+            get("devices"), get("clients"), get_device(DEVICE), get_device(DEVICE, "/statistics/latest"),
+        ])
+        self.assertEqual([section["outcome"] for section in sections], ["complete", "complete"])
+        record, = sections[0]["records"]
+        for key in ("details", "statistics"):
+            self.assertEqual(datetime.fromisoformat(record[key].pop("observed_at")).utcoffset(), timedelta(0))
+        self.assertEqual(record, {
+            "id": f"unifi:{SITE}:managed_devices:{DEVICE}", "state": "OFFLINE", "firmware_version": "6.6.55",
+            "details": {
+                "adopted_at": adopted, "provisioned_at": provisioned, "uplink_device_id": OTHER_DEVICE,
+                "ports": [{"index": 1, "state": "UP", "connector": "RJ45", "max_speed_mbps": 2500,
+                           "speed_mbps": 1000, "poe": {"standard": "802.3at", "enabled": False, "state": "DOWN"}},
+                          {"index": 2, "state": "DOWN"}],
+                "radios": [{"frequency_ghz": "5", "wlan_standard": "802.11ax", "channel": 36,
+                            "channel_width_mhz": 40}],
+            },
+            "statistics": {
+                "uptime_seconds": 0, "last_heartbeat_at": heartbeat,
+                "load_average_1_min": 0.125, "load_average_15_min": 1.5,
+                "cpu_utilization_pct": 0, "memory_utilization_pct": 12.5,
+                "radios": [{"frequency_ghz": "5", "tx_retries_pct": 2.25}],
+            },
+        })
+
+    def test_unavailable_optional_reads_do_not_change_base_outcomes_or_stop_other_reads(self):
+        sections, requests = self.capture(
+            response(page({"id": DEVICE, "state": "OFFLINE"}, {"id": OTHER_DEVICE, "state": "ONLINE"})),
+            response(page({"id": VPN, "type": "VPN"})),
+            response({"error": KEY}, 302, ("Location: https://elsewhere.invalid/",)),
+            response({"uptimeSec": False, "cpuUtilizationPct": float("nan"), "memoryUtilizationPct": 101,
+                      "lastHeartbeatAt": "2026-10-01", "loadAverage1Min": -1,
+                      "interfaces": {"radios": [{"frequencyGHz": "5", "txRetriesPct": "1.5"}]}}),
+            response({"id": DEVICE, "adoptedAt": "2026-10-01T12:00:00Z"}),
+            response({"uptimeSec": 12}),
+            config={**CONFIG, "device_details": True, "device_statistics": True},
+        )
+        self.assertEqual([request.split(b"\r\n", 1)[0] for request in requests], [
+            get("devices"), get("clients"), get_device(DEVICE), get_device(DEVICE, "/statistics/latest"),
+            get_device(OTHER_DEVICE), get_device(OTHER_DEVICE, "/statistics/latest"),
+        ])
+        sections[0]["records"][1]["statistics"].pop("observed_at")
+        self.assertEqual(sections, [
+            {"section": "managed_devices", "outcome": "complete", "records": [
+                {"id": f"unifi:{SITE}:managed_devices:{DEVICE}", "state": "OFFLINE"},
+                {"id": f"unifi:{SITE}:managed_devices:{OTHER_DEVICE}", "state": "ONLINE",
+                 "statistics": {"uptime_seconds": 12}},
+            ]},
+            {"section": "connected_clients", "outcome": "complete", "records": [
+                {"id": f"unifi:{SITE}:connected_clients:{VPN}", "type": "VPN"},
+            ]},
+        ])
+
+    def test_statistics_only_bounds_requests_and_optional_response_size(self):
+        devices = [f"20000000-0000-4000-8000-{n:012x}" for n in range(18)]
+        too_large = b'{"uptimeSec": 512}' + b" " * (256 * 1024)
+        sections, requests = self.capture(
+            response(page(*({"id": device} for device in devices))), response(page()),
+            response(too_large), response({"private": KEY}, 404), TimeoutError(), response(b"{"),
+            response({"uptimeSec": 7}), *([response({})] * 11),
+            config={**CONFIG, "device_statistics": True},
+        )
+        self.assertEqual([request.split(b"\r\n", 1)[0] for request in requests], [
+            get("devices"), get("clients"),
+            *(get_device(device, "/statistics/latest") for i, device in enumerate(devices[:16]) if i != 2),
+        ])
+        records = sections[0]["records"]
+        self.assertEqual(sections[0]["outcome"], "complete")
+        self.assertEqual([record["id"] for record in records],
+                         [f"unifi:{SITE}:managed_devices:{device}" for device in devices])
+        self.assertEqual([(i, row["statistics"]["uptime_seconds"])
+                          for i, row in enumerate(records) if "statistics" in row], [(4, 7)])
+        self.assertFalse(any("details" in row for row in records))
 
     def test_empty_connected_list_does_not_emit_a_disconnected_record(self):
         before, _ = self.capture(response(page()), response(page({"id": VPN, "type": "VPN"})))
