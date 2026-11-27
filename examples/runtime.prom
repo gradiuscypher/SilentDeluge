@@ -1,0 +1,5 @@
+# TYPE incus_cpu_seconds_total counter
+incus_cpu_seconds_total{project="stage",name="tin-piano",type="virtual-machine",cpu="0"} 32.7
+incus_cpu_seconds_total{project="stage",name="tin-piano",type="virtual-machine",cpu="1"} 16
+incus_boot_time_seconds{project="stage",name="trapdoor",type="container"} 1000
+incus_boot_time_seconds{project="backstage",name="paper-moon",type="container"} 1000

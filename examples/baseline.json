@@ -1,0 +1,14 @@
+{
+  "source": "synthetic-incus",
+  "scope": "toy-theatre",
+  "timestamp": "2025-01-01T10:00:00Z",
+  "outcome": "complete",
+  "instances": [
+    {
+      "name": "paper-moon",
+      "type": "container",
+      "status": "Running",
+      "expanded_config": {"limits.cpu": "1", "limits.memory": "256MiB"}
+    }
+  ]
+}

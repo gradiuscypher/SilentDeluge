@@ -1,0 +1,27 @@
+{
+  "source": "synthetic-incus",
+  "scope": "toy-theatre",
+  "timestamp": "2025-01-01T10:10:00Z",
+  "outcome": "complete",
+  "instances": [
+    {
+      "name": "velvet-curtain",
+      "type": "container",
+      "status": "Stopped",
+      "config": {},
+      "expanded_config": {"limits.cpu": "2", "limits.memory": "1024MiB"}
+    },
+    {
+      "name": "tin-piano",
+      "type": "virtual-machine",
+      "status": "Running",
+      "expanded_config": {"limits.cpu": "4", "limits.memory": "2GiB"}
+    },
+    {
+      "name": "painted-sun",
+      "type": "container",
+      "status": "Running",
+      "expanded_config": {}
+    }
+  ]
+}
