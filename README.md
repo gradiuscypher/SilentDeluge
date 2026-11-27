@@ -1,8 +1,8 @@
 # SilentDeluge
 
-SilentDeluge is a proposed open-source monitoring system for homelabs, personal computers, and network devices. Its first job is to answer a small question reliably: **which Incus guests did I declare, which were observed, and where do they disagree?**
+SilentDeluge collects inventory for homelabs, personal computers, and network devices. Start with **what an approved source can observe**. Optionally compare those observations with declarations; no hand-built first inventory is required.
 
-**Status: offline Incus inventory slice.** The commands read local evidence files. Neither installs a collector or contacts a host.
+Start with the [collection guide](COLLECTION.md) to select a configured source. The offline examples below demonstrate the separate Incus comparison path without contacting any host.
 
 - [Milestone plan](PLAN.md): first deliverable, local verification, and the public/private boundary.
 - [Domain glossary](CONTEXT.md): agreed meanings and constraints for inventory, permissions, monitoring, and evidence.
@@ -39,14 +39,14 @@ Both runs start with the same verified sighting of `paper-moon`. The complete sc
 
 The first invariant, [`inventory.absence-requires-complete-scan`](test_inventory.py), is declared alongside its executable scenarios. Change them together.
 
-**Private acceptance still required.** Privately preview and approve the mapping from the operator's instance lists; do not copy the lists into this repository. Verify the server/project, requested instance reads, and least-privilege credential scope before taking a real snapshot. If those reads cannot be scoped, keep declarations disconnected. Compare the same project's authorized read-only snapshot through this command, checking effective inherited limits, stopped guests, and complete versus incomplete evidence. No guest probes, lifecycle actions, or changes to the project are needed.
+**Private acceptance:** a one-time fixed-field export and a separate metrics capture have been exercised privately. Each installation must verify its own source scope, credential restrictions and completeness. Neither path grants permission to enter guests or schedule reads.
 
 ## Direction beyond the first milestone
 
-Start with static inventory. Later integrations can add UniFi, Ubuntu, Windows, and macOS observations, then live metrics, process data, and logs. Prefer existing collectors and storage engines when they fit. Security detections should consume the same authorized logs as interactive queries, not require a second collection pipeline. Python detection rules are intended to run without an AI provider.
+Inventory precedes live monitoring and alerts. Future integrations can add Windows and macOS observations, process data, and logs. Prefer existing collectors and storage engines when they fit. Security detections should consume the same authorized logs as interactive queries, not require a second collection pipeline. Python detection rules are intended to run without an AI provider.
 
 Operators should be able to onboard sources through their agent harness of choice and use the same permission-scoped capabilities from chat or the web UI. Integration skills and scripts should be reusable; agents may prepare new tools, but that does not grant permission to run them unattended. Start with local multi-user authentication and role-based access; leave room for single sign-on later.
 
 The UI should follow the GRDS design direction, with editorial layouts for investigation reports. Discord is the first intended notification destination; other channels should be possible without changing the finding lifecycle. Infrastructure management is a later capability, separate from advisory monitoring. Technology choices and scheduling beyond the first milestone remain open.
 
-Use local checks first. GitHub issues, Projects, pull-request automation, and hosted CI belong to a later development phase, not this handoff.
+To start or resume a GitHub Project, follow the [orchestrator runbook](ORCHESTRATION.md). Use synthetic local checks; hosted CI is a separate decision.
