@@ -1,0 +1,42 @@
+[Unit]
+Description=SilentDeluge inventory web app
+After=network.target
+
+[Service]
+Type=exec
+User=silentdeluge-web
+Group=silentdeluge-web
+WorkingDirectory=/opt/silentdeluge/current
+EnvironmentFile=/etc/silentdeluge-web.env
+ExecStartPre=/usr/bin/test -n ${PUBLIC_ORIGIN}
+ExecStart=/usr/bin/python3 -B /opt/silentdeluge/current/web_inventory.py serve --config /var/lib/silentdeluge-web/web.json --port 18765 --public-origin=${PUBLIC_ORIGIN}
+Restart=on-failure
+RestartSec=5s
+
+StateDirectory=silentdeluge-web
+StateDirectoryMode=0700
+UMask=0077
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/silentdeluge-web/web.json
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+# nginx shares this host's network namespace; do not use PrivateNetwork=.
+RestrictAddressFamilies=AF_INET
+IPAddressDeny=any
+IPAddressAllow=127.0.0.1/32
+SocketBindDeny=any
+SocketBindAllow=ipv4:tcp:18765
+
+[Install]
+WantedBy=multi-user.target
